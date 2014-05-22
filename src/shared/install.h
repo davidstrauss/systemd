@@ -106,3 +106,6 @@ UnitFileChangeType unit_file_change_type_from_string(const char *s) _pure_;
 EnabledContext *enabled_context_new(void);
 void enabled_context_free(EnabledContext *ec);
 
+DEFINE_TRIVIAL_CLEANUP_FUNC(EnabledContext*, enabled_context_free);
+
+#define _cleanup_enabled_context_free_ _cleanup_(enabled_context_freep)

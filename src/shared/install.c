@@ -350,209 +350,7 @@ static int remove_marked_symlinks(
         return r;
 }
 
-static int find_symlinks_fd(
-                const char *name,
-                int fd,
-                const char *path,
-                const char *config_path,
-                bool *same_name_link) {
-
-        int r = 0;
-        _cleanup_closedir_ DIR *d = NULL;
-
-        assert(name);
-        assert(fd >= 0);
-        assert(path);
-        assert(config_path);
-        assert(same_name_link);
-
-        d = fdopendir(fd);
-        if (!d) {
-                safe_close(fd);
-                return -errno;
-        }
-
-        for (;;) {
-                struct dirent *de;
-
-                errno = 0;
-                de = readdir(d);
-                if (!de && errno != 0)
-                        return -errno;
-
-                if (!de)
-                        return r;
-
-                if (ignore_file(de->d_name))
-                        continue;
-
-                dirent_ensure_type(d, de);
-
-                if (de->d_type == DT_DIR) {
-                        int nfd, q;
-                        _cleanup_free_ char *p = NULL;
-
-                        nfd = openat(fd, de->d_name, O_RDONLY|O_NONBLOCK|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
-                        if (nfd < 0) {
-                                if (errno == ENOENT)
-                                        continue;
-
-                                if (r == 0)
-                                        r = -errno;
-                                continue;
-                        }
-
-                        p = path_make_absolute(de->d_name, path);
-                        if (!p) {
-                                safe_close(nfd);
-                                return -ENOMEM;
-                        }
-
-                        /* This will close nfd, regardless whether it succeeds or not */
-                        q = find_symlinks_fd(name, nfd, p, config_path, same_name_link);
-
-                        if (q > 0)
-                                return 1;
-
-                        if (r == 0)
-                                r = q;
-
-                } else if (de->d_type == DT_LNK) {
-                        _cleanup_free_ char *p = NULL, *dest = NULL;
-                        bool found_path, found_dest, b = false;
-                        int q;
-
-                        /* Acquire symlink name */
-                        p = path_make_absolute(de->d_name, path);
-                        if (!p)
-                                return -ENOMEM;
-
-                        /* Acquire symlink destination */
-                        q = readlink_and_canonicalize(p, &dest);
-                        if (q < 0) {
-                                if (q == -ENOENT)
-                                        continue;
-
-                                if (r == 0)
-                                        r = q;
-                                continue;
-                        }
-
-                        /* Check if the symlink itself matches what we
-                         * are looking for */
-                        if (path_is_absolute(name))
-                                found_path = path_equal(p, name);
-                        else
-                                found_path = streq(de->d_name, name);
-
-                        /* Check if what the symlink points to
-                         * matches what we are looking for */
-                        if (path_is_absolute(name))
-                                found_dest = path_equal(dest, name);
-                        else
-                                found_dest = streq(basename(dest), name);
-
-                        if (found_path && found_dest) {
-                                _cleanup_free_ char *t = NULL;
-
-                                /* Filter out same name links in the main
-                                 * config path */
-                                t = path_make_absolute(name, config_path);
-                                if (!t)
-                                        return -ENOMEM;
-
-                                b = path_equal(t, p);
-                        }
-
-                        if (b)
-                                *same_name_link = true;
-                        else if (found_path || found_dest)
-                                return 1;
-                }
-        }
-}
-
-static int find_symlinks(
-                const char *name,
-                const char *config_path,
-                bool *same_name_link) {
-
-        int fd;
-
-        assert(name);
-        assert(config_path);
-        assert(same_name_link);
-
-        fd = open(config_path, O_RDONLY|O_NONBLOCK|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
-        if (fd < 0) {
-                if (errno == ENOENT)
-                        return 0;
-                return -errno;
-        }
-
-        /* This takes possession of fd and closes it */
-        return find_symlinks_fd(name, fd, config_path, config_path, same_name_link);
-}
-
-static int find_symlinks_in_scope(
-                UnitFileScope scope,
-                const char *root_dir,
-                const char *name,
-                UnitFileState *state) {
-
-        int r;
-        _cleanup_free_ char *path2 = NULL;
-        bool same_name_link_runtime = false, same_name_link = false;
-
-        assert(scope >= 0);
-        assert(scope < _UNIT_FILE_SCOPE_MAX);
-        assert(name);
-
-        if (scope == UNIT_FILE_SYSTEM || scope == UNIT_FILE_GLOBAL) {
-                _cleanup_free_ char *path = NULL;
-
-                /* First look in runtime config path */
-                r = get_config_path(scope, true, root_dir, &path);
-                if (r < 0)
-                        return r;
-
-                r = find_symlinks(name, path, &same_name_link_runtime);
-                if (r < 0)
-                        return r;
-                else if (r > 0) {
-                        *state = UNIT_FILE_ENABLED_RUNTIME;
-                        return r;
-                }
-        }
-
-        /* Then look in the normal config path */
-        r = get_config_path(scope, false, root_dir, &path2);
-        if (r < 0)
-                return r;
-
-        r = find_symlinks(name, path2, &same_name_link);
-        if (r < 0)
-                return r;
-        else if (r > 0) {
-                *state = UNIT_FILE_ENABLED;
-                return r;
-        }
-
-        /* Hmm, we didn't find it, but maybe we found the same name
-         * link? */
-        if (same_name_link_runtime) {
-                *state = UNIT_FILE_LINKED_RUNTIME;
-                return 1;
-        } else if (same_name_link) {
-                *state = UNIT_FILE_LINKED;
-                return 1;
-        }
-
-        return 0;
-}
-
-EnabledContext *enabled_context_new(void)
-{
+EnabledContext *enabled_context_new(void) {
         EnabledContext *ec;
         int r;
 
@@ -575,9 +373,8 @@ EnabledContext *enabled_context_new(void)
         return ec;
 }
 
-void enabled_context_free(EnabledContext *ec)
-{
-        hashmap_free_free(ec->symlinks); // make sure that all strvs are _cleanup_free_?
+void enabled_context_free(EnabledContext *ec) {
+        hashmap_free_free(ec->symlinks); // @TODO: make sure that all strvs are _cleanup_free_?
         ec->symlinks = NULL;
         hashmap_free(ec->dirs);
         ec->dirs = NULL;
@@ -605,9 +402,9 @@ static int enabled_context_build_cache_fd(
         }
 
         r = fstat(fd, &statbuf);
-        if (r < 0) {
+        if (r < 0)
                 return r;
-        }
+
         mtime = timespec_load(&statbuf.st_mtim);
         hashmap_put(ec->dirs, path, &mtime);
 
@@ -748,8 +545,12 @@ static int enabled_context_lookup_state(
 
                 /* If the symlink path is in scope, the unit is enabled */
                 STRV_FOREACH(p, paths.unit_path) {
+                        // @TODO: Use get_config_path(scope, true, root_dir, &path);
+                        // and r = get_config_path(scope, false, root_dir, &path2);
+                        // to identify UNIT_FILE_LINKED_RUNTIME and UNIT_FILE_LINKED
+
                         if (path_startswith(i, p)) {
-                                state = UNIT_FILE_ENABLED;
+                                *state = UNIT_FILE_ENABLED;
                                 return 1;
                         }
                 }
@@ -765,20 +566,26 @@ static int enabled_context_find_symlinks_in_scope(
         const char *name,
         UnitFileState *state) {
 
+        _cleanup_enabled_context_free_ EnabledContext *ec_cleanup = NULL;
         _cleanup_free_ char *dir;
         struct stat statbuf;
         usec_t *mtime;
         Iterator i;
         int r;
 
-        assert(ec);
         assert(scope >= 0);
         assert(scope < _UNIT_FILE_SCOPE_MAX);
         assert(name);
 
-        r = enabled_context_lookup_state(ec, scope, name, state);
-        if (r > 0)
-                return r;
+        /* If no context is provided, we'll build it lazily and free it. */
+        if (ec == NULL) {
+                /* By setting ec_cleanup, ec will be freed automatically. */
+                ec_cleanup = ec;
+        } else {
+                r = enabled_context_lookup_state(ec, scope, name, state);
+                if (r > 0)
+                        return r;
+        }
 
         /* We didn't find it; maybe the cache needs to be reloaded */
         HASHMAP_FOREACH_KEY(mtime, dir, ec->dirs, i) {
@@ -1965,10 +1772,7 @@ UnitFileState unit_file_get_state(
                         }
                 }
 
-                if (ec)
-                        r = enabled_context_find_symlinks_in_scope(ec, scope, root_dir, name, &state);
-                else
-                        r = find_symlinks_in_scope(scope, root_dir, name, &state);
+                r = enabled_context_find_symlinks_in_scope(ec, scope, root_dir, name, &state);
 
                 if (r < 0)
                         return r;
@@ -2233,10 +2037,7 @@ int unit_file_get_list(
                                 goto found;
                         }
 
-                        if (ec)
-                                r = enabled_context_find_symlinks_in_scope(ec, scope, root_dir, de->d_name, &f->state);
-                        else
-                                r = find_symlinks_in_scope(scope, root_dir, de->d_name, &f->state);
+                        r = enabled_context_find_symlinks_in_scope(ec, scope, root_dir, de->d_name, &f->state);
 
                         if (r < 0)
                                 return r;
