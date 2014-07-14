@@ -139,7 +139,7 @@ static int spawn_curl(char* url) {
 
 static int spawn_getter(char *getter, char *url) {
         int r;
-        char _cleanup_strv_free_ **words = NULL;
+        _cleanup_strv_free_ char **words = NULL;
 
         assert(getter);
         words = strv_split_quoted(getter);
@@ -154,7 +154,7 @@ static int spawn_getter(char *getter, char *url) {
 }
 
 static int open_output(Writer *s, const char* url) {
-        char _cleanup_free_ *name, *output = NULL;
+        _cleanup_free_ char *name, *output = NULL;
         char *c;
         int r;
 
@@ -185,7 +185,7 @@ static int open_output(Writer *s, const char* url) {
                 if (r < 0)
                         return log_oom();
         } else {
-                r = is_dir(arg_output);
+                r = is_dir(arg_output, true);
                 if (r > 0) {
                         r = asprintf(&output,
                                      "%s/remote-%s.journal", arg_output, name);
@@ -291,7 +291,7 @@ static int remove_source(RemoteServer *s, int fd) {
 
 static int add_source(RemoteServer *s, int fd, const char* name) {
         RemoteSource *source = NULL;
-        char *realname;
+        _cleanup_free_ char *realname = NULL;
         int r;
 
         assert(s);
@@ -307,11 +307,11 @@ static int add_source(RemoteServer *s, int fd, const char* name) {
                         return log_oom();
         }
 
-        log_debug("Creating source for fd:%d (%s)", fd, name);
+        log_debug("Creating source for fd:%d (%s)", fd, realname);
 
         r = get_source_for_fd(s, fd, &source);
         if (r < 0) {
-                log_error("Failed to create source for fd:%d (%s)", fd, name);
+                log_error("Failed to create source for fd:%d (%s)", fd, realname);
                 return r;
         }
         assert(source);
@@ -745,8 +745,8 @@ static int remoteserver_init(RemoteServer *s) {
         }
 
         if (arg_url) {
-                char _cleanup_free_ *url = NULL;
-                char _cleanup_strv_free_ **urlv = strv_new(arg_url, "/entries", NULL);
+                _cleanup_free_ char *url = NULL;
+                _cleanup_strv_free_ char **urlv = strv_new(arg_url, "/entries", NULL);
                 if (!urlv)
                         return log_oom();
                 url = strv_join(urlv, "");
@@ -1210,8 +1210,8 @@ int main(int argc, char **argv) {
         if (remoteserver_init(&s) < 0)
                 return EXIT_FAILURE;
 
-        log_debug("%s running as pid %lu",
-                  program_invocation_short_name, (unsigned long) getpid());
+        log_debug("%s running as pid "PID_FMT,
+                  program_invocation_short_name, getpid());
         sd_notify(false,
                   "READY=1\n"
                   "STATUS=Processing requests...");

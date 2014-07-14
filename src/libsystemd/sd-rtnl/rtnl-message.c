@@ -146,7 +146,7 @@ int sd_rtnl_message_new_route(sd_rtnl *rtnl, sd_rtnl_message **ret,
                 return r;
 
         if (nlmsg_type == RTM_NEWROUTE)
-                (*ret)->hdr->nlmsg_flags |= NLM_F_CREATE | NLM_F_EXCL;
+                (*ret)->hdr->nlmsg_flags |= NLM_F_CREATE | NLM_F_APPEND;
 
         rtm = NLMSG_DATA((*ret)->hdr);
 
@@ -286,6 +286,21 @@ int sd_rtnl_message_addr_get_family(sd_rtnl_message *m, unsigned char *family) {
         ifa = NLMSG_DATA(m->hdr);
 
         *family = ifa->ifa_family;
+
+        return 0;
+}
+
+int sd_rtnl_message_addr_get_prefixlen(sd_rtnl_message *m, unsigned char *prefixlen) {
+        struct ifaddrmsg *ifa;
+
+        assert_return(m, -EINVAL);
+        assert_return(m->hdr, -EINVAL);
+        assert_return(rtnl_message_type_is_addr(m->hdr->nlmsg_type), -EINVAL);
+        assert_return(prefixlen, -EINVAL);
+
+        ifa = NLMSG_DATA(m->hdr);
+
+        *prefixlen = ifa->ifa_prefixlen;
 
         return 0;
 }
@@ -452,24 +467,28 @@ int sd_rtnl_message_link_get_flags(sd_rtnl_message *m, unsigned *flags) {
 /* If successful the updated message will be correctly aligned, if
    unsuccessful the old message is untouched. */
 static int add_rtattr(sd_rtnl_message *m, unsigned short type, const void *data, size_t data_length) {
-        uint32_t rta_length, message_length;
+        uint32_t rta_length;
+        size_t message_length, padding_length;
         struct nlmsghdr *new_hdr;
         struct rtattr *rta;
         char *padding;
         unsigned i;
+        int offset;
 
         assert(m);
         assert(m->hdr);
         assert(!m->sealed);
         assert(NLMSG_ALIGN(m->hdr->nlmsg_len) == m->hdr->nlmsg_len);
-        assert(!data || data_length > 0);
-        assert(data || m->n_containers < RTNL_CONTAINER_DEPTH);
+        assert(!data || data_length);
+
+        /* get offset of the new attribute */
+        offset = m->hdr->nlmsg_len;
 
         /* get the size of the new rta attribute (with padding at the end) */
         rta_length = RTA_LENGTH(data_length);
 
         /* get the new message size (with padding at the end) */
-        message_length = m->hdr->nlmsg_len + RTA_ALIGN(rta_length);
+        message_length = offset + RTA_ALIGN(rta_length);
 
         /* realloc to fit the new attribute */
         new_hdr = realloc(m->hdr, message_length);
@@ -478,33 +497,35 @@ static int add_rtattr(sd_rtnl_message *m, unsigned short type, const void *data,
         m->hdr = new_hdr;
 
         /* get pointer to the attribute we are about to add */
-        rta = (struct rtattr *) ((uint8_t *) m->hdr + m->hdr->nlmsg_len);
+        rta = (struct rtattr *) ((uint8_t *) m->hdr + offset);
 
         /* if we are inside containers, extend them */
         for (i = 0; i < m->n_containers; i++)
-                GET_CONTAINER(m, i)->rta_len += message_length - m->hdr->nlmsg_len;
+                GET_CONTAINER(m, i)->rta_len += message_length - offset;
 
         /* fill in the attribute */
         rta->rta_type = type;
         rta->rta_len = rta_length;
-        if (!data) {
-                //TODO: simply return this value rather than check for !data
-                /* this is the start of a new container */
-                m->container_offsets[m->n_containers ++] = m->hdr->nlmsg_len;
-        } else {
+        if (data)
                 /* we don't deal with the case where the user lies about the type
                  * and gives us too little data (so don't do that)
-                */
+                 */
                 padding = mempcpy(RTA_DATA(rta), data, data_length);
-                /* make sure also the padding at the end of the message is initialized */
-                memzero(padding,
-                        (uint8_t *) m->hdr + message_length - (uint8_t *) padding);
+        else {
+                /* if no data was passed, make sure we still initialize the padding
+                   note that we can have data_length > 0 (used by some containers) */
+                padding = RTA_DATA(rta);
+                data_length = 0;
         }
+
+        /* make sure also the padding at the end of the message is initialized */
+        padding_length = (uint8_t*)m->hdr + message_length - (uint8_t*)padding;
+        memzero(padding, padding_length);
 
         /* update message size */
         m->hdr->nlmsg_len = message_length;
 
-        return 0;
+        return offset;
 }
 
 static int message_attribute_has_type(sd_rtnl_message *m, uint16_t attribute_type, uint16_t data_type) {
@@ -679,6 +700,7 @@ int sd_rtnl_message_open_container(sd_rtnl_message *m, unsigned short type) {
 
         assert_return(m, -EINVAL);
         assert_return(!m->sealed, -EPERM);
+        assert_return(m->n_containers < RTNL_CONTAINER_DEPTH, -ERANGE);
 
         r = message_attribute_has_type(m, type, NLA_NESTED);
         if (r < 0)
@@ -695,6 +717,8 @@ int sd_rtnl_message_open_container(sd_rtnl_message *m, unsigned short type) {
         r = add_rtattr(m, type, NULL, size);
         if (r < 0)
                 return r;
+
+        m->container_offsets[m->n_containers ++] = r;
 
         return 0;
 }
@@ -724,6 +748,8 @@ int sd_rtnl_message_open_container_union(sd_rtnl_message *m, unsigned short type
         r = add_rtattr(m, type, NULL, 0);
         if (r < 0)
                 return r;
+
+        m->container_offsets[m->n_containers ++] = r;
 
         return 0;
 }
@@ -1072,6 +1098,60 @@ int socket_write_message(sd_rtnl *nl, sd_rtnl_message *m) {
         return k;
 }
 
+static int socket_recv_message(int fd, struct iovec *iov, uint32_t *_group, bool peek) {
+        uint8_t cred_buffer[CMSG_SPACE(sizeof(struct ucred)) +
+                            CMSG_SPACE(sizeof(struct nl_pktinfo))];
+        struct msghdr msg = {
+                .msg_iov = iov,
+                .msg_iovlen = 1,
+                .msg_control = cred_buffer,
+                .msg_controllen = sizeof(cred_buffer),
+        };
+        struct cmsghdr *cmsg;
+        uint32_t group = 0;
+        bool auth = false;
+        int r;
+
+        assert(fd >= 0);
+        assert(iov);
+
+        r = recvmsg(fd, &msg, MSG_TRUNC | (peek ? MSG_PEEK : 0));
+        if (r < 0)
+                /* no data */
+                return (errno == EAGAIN) ? 0 : -errno;
+        else if (r == 0)
+                /* connection was closed by the kernel */
+                return -ECONNRESET;
+
+        for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+                if (cmsg->cmsg_level == SOL_SOCKET &&
+                    cmsg->cmsg_type == SCM_CREDENTIALS &&
+                    cmsg->cmsg_len == CMSG_LEN(sizeof(struct ucred))) {
+                        struct ucred *ucred = (void *)CMSG_DATA(cmsg);
+
+                        /* from the kernel */
+                        if (ucred->uid == 0 && ucred->pid == 0)
+                                auth = true;
+                } else if (cmsg->cmsg_level == SOL_NETLINK &&
+                           cmsg->cmsg_type == NETLINK_PKTINFO &&
+                           cmsg->cmsg_len == CMSG_LEN(sizeof(struct nl_pktinfo))) {
+                        struct nl_pktinfo *pktinfo = (void *)CMSG_DATA(cmsg);
+
+                        /* multi-cast group */
+                        group = pktinfo->group;
+                }
+        }
+
+        if (!auth)
+                /* not from the kernel, ignore */
+                return 0;
+
+        if (group)
+                *_group = group;
+
+        return r;
+}
+
 /* On success, the number of bytes received is returned and *ret points to the received message
  * which has a valid header and the correct size.
  * If nothing useful was received 0 is returned.
@@ -1079,16 +1159,9 @@ int socket_write_message(sd_rtnl *nl, sd_rtnl_message *m) {
  */
 int socket_read_message(sd_rtnl *rtnl) {
         _cleanup_rtnl_message_unref_ sd_rtnl_message *first = NULL;
-        uint8_t cred_buffer[CMSG_SPACE(sizeof(struct ucred))];
         struct iovec iov = {};
-        struct msghdr msg = {
-                .msg_iov = &iov,
-                .msg_iovlen = 1,
-                .msg_control = cred_buffer,
-                .msg_controllen = sizeof(cred_buffer),
-        };
-        struct cmsghdr *cmsg;
-        bool auth = false, multi_part = false, done = false;
+        uint32_t group = 0;
+        bool multi_part = false, done = false;
         struct nlmsghdr *new_msg;
         size_t len;
         int r;
@@ -1099,13 +1172,9 @@ int socket_read_message(sd_rtnl *rtnl) {
         assert(rtnl->rbuffer_allocated >= sizeof(struct nlmsghdr));
 
         /* read nothing, just get the pending message size */
-        r = recvmsg(rtnl->fd, &msg, MSG_PEEK | MSG_TRUNC);
-        if (r < 0)
-                /* no data */
-                return (errno == EAGAIN) ? 0 : -errno;
-        else if (r == 0)
-                /* connection was closed by the kernel */
-                return -ECONNRESET;
+        r = socket_recv_message(rtnl->fd, &iov, &group, true);
+        if (r <= 0)
+                return r;
         else
                 len = (size_t)r;
 
@@ -1118,37 +1187,16 @@ int socket_read_message(sd_rtnl *rtnl) {
         iov.iov_base = rtnl->rbuffer;
         iov.iov_len = rtnl->rbuffer_allocated;
 
-        r = recvmsg(rtnl->fd, &msg, MSG_TRUNC);
-        if (r < 0)
-                /* no data */
-                return (errno == EAGAIN) ? 0 : -errno;
-        else if (r == 0)
-                /* connection was closed by the kernel */
-                return -ECONNRESET;
+        /* read the pending message */
+        r = socket_recv_message(rtnl->fd, &iov, &group, false);
+        if (r <= 0)
+                return r;
         else
                 len = (size_t)r;
 
         if (len > rtnl->rbuffer_allocated)
                 /* message did not fit in read buffer */
                 return -EIO;
-
-        for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
-                if (cmsg->cmsg_level == SOL_SOCKET &&
-                    cmsg->cmsg_type == SCM_CREDENTIALS &&
-                    cmsg->cmsg_len == CMSG_LEN(sizeof(struct ucred))) {
-                        struct ucred *ucred = (void *)CMSG_DATA(cmsg);
-
-                        /* from the kernel */
-                        if (ucred->uid == 0 && ucred->pid == 0) {
-                                auth = true;
-                                break;
-                        }
-                }
-        }
-
-        if (!auth)
-                /* not from the kernel, ignore */
-                return 0;
 
         if (NLMSG_OK(rtnl->rbuffer, len) && rtnl->rbuffer->nlmsg_flags & NLM_F_MULTI) {
                 multi_part = true;
@@ -1166,7 +1214,7 @@ int socket_read_message(sd_rtnl *rtnl) {
                 _cleanup_rtnl_message_unref_ sd_rtnl_message *m = NULL;
                 const NLType *nl_type;
 
-                if (new_msg->nlmsg_pid && new_msg->nlmsg_pid != rtnl->sockaddr.nl.nl_pid)
+                if (!group && new_msg->nlmsg_pid != rtnl->sockaddr.nl.nl_pid)
                         /* not broadcast and not for us */
                         continue;
 

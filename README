@@ -43,7 +43,7 @@ REQUIREMENTS:
 
         Kernel Config Options:
           CONFIG_DEVTMPFS
-          CONFIG_CGROUPS (it's OK to disable all controllers)
+          CONFIG_CGROUPS (it is OK to disable all controllers)
           CONFIG_INOTIFY_USER
           CONFIG_SIGNALFD
           CONFIG_TIMERFD
@@ -80,6 +80,10 @@ REQUIREMENTS:
           CONFIG_TMPFS_XATTR
           CONFIG_SECCOMP
 
+        Required for CPUShares in resource control unit settings
+          CONFIG_CGROUP_SCHED
+          CONFIG_FAIR_GROUP_SCHED
+
         For systemd-bootchart, several proc debug interfaces are required:
           CONFIG_SCHEDSTATS
           CONFIG_SCHED_DEBUG
@@ -97,7 +101,7 @@ REQUIREMENTS:
         If systemd is compiled with libseccomp support on
         architectures which do not use socketcall() and where seccomp
         is supported (this effectively means x86-64 and ARM, but
-        excludes 32bit x86!), then nspawn will now install a
+        excludes 32-bit x86!), then nspawn will now install a
         work-around seccomp filter that makes containers boot even
         with audit being enabled. This works correctly only on kernels
         3.14 and newer though. TL;DR: turn audit off, still.
@@ -111,13 +115,15 @@ REQUIREMENTS:
         libcryptsetup (optional)
         libaudit (optional)
         libacl (optional)
-        libattr (optional)
         libselinux (optional)
         liblzma (optional)
+        liblz4 >= 119 (optional)
         libgcrypt (optional)
         libqrencode (optional)
         libmicrohttpd (optional)
         libpython (optional)
+        gobject-introspection > 1.40.0 (optional)
+        elfutils >= 158 (optional)
         make, gcc, and similar tools
 
         During runtime, you need the following additional
@@ -164,7 +170,7 @@ USERS AND GROUPS:
         even in the very early boot stages, where no other databases
         and network are available:
 
-        tty, dialout, kmem, video, audio, lp, floppy, cdrom, tape, disk
+        audio, cdrom, dialout, disk, input, kmem, lp, tape, tty, video
 
         During runtime, the journal daemon requires the
         "systemd-journal" system group to exist. New journal files will
@@ -183,6 +189,18 @@ USERS AND GROUPS:
         exist. During execution this network facing service will drop
         privileges and assume this uid/gid for security reasons.
 
+        Similarly, the NTP daemon requires the "systemd-timesync" system
+        user and group to exist.
+
+        Similarly, the network management daemon requires the
+        "systemd-network" system user and group to exist.
+
+        Similarly, the name resolution daemon requires the
+        "systemd-resolve" system user and group to exist.
+
+        Similarly, the kdbus dbus1 proxy daemon requires the
+        "systemd-bus-proxy" system user and group to exist.
+
 WARNINGS:
         systemd will warn you during boot if /etc/mtab is not a
         symlink to /proc/mounts. Please ensure that /etc/mtab is a
@@ -200,7 +218,7 @@ WARNINGS:
         supported anymore by the basic set of Linux OS components.
 
         systemd requires that the /run mount point exists. systemd also
-        requires that /var/run is a a symlink → /run.
+        requires that /var/run is a a symlink to /run.
 
         For more information on this issue consult
         http://freedesktop.org/wiki/Software/systemd/separate-usr-is-broken

@@ -103,7 +103,10 @@ int sd_peer_get_machine_name(int fd, char **machine);
 int sd_peer_get_slice(int fd, char **slice);
 
 /* Get state from UID. Possible states: offline, lingering, online, active, closing */
-int sd_uid_get_state(uid_t uid, char**state);
+int sd_uid_get_state(uid_t uid, char **state);
+
+/* Return primary session of user, if there is any */
+int sd_uid_get_display(uid_t uid, char **session);
 
 /* Return 1 if UID has session on seat. If require_active is true, this will
  * look for active sessions only. */
@@ -177,6 +180,9 @@ int sd_seat_can_graphical(const char *seat);
 
 /* Return the class of machine */
 int sd_machine_get_class(const char *machine, char **clazz);
+
+/* Return the list if host-side network interface indexes of a machine */
+int sd_machine_get_ifindexes(const char *machine, int **ifindexes);
 
 /* Get all seats, store in *seats. Returns the number of seats. If
  * seats is NULL, this only returns the number of seats. */

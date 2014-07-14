@@ -142,6 +142,12 @@ const char* exit_status_to_string(ExitStatus status, ExitStatusLevel level) {
 
                 case EXIT_RUNTIME_DIRECTORY:
                         return "RUNTIME_DIRECTORY";
+
+                case EXIT_CHOWN:
+                        return "CHOWN";
+
+                case EXIT_MAKE_STARTER:
+                        return "MAKE_STARTER";
                 }
         }
 
@@ -177,7 +183,7 @@ bool is_clean_exit(int code, int status, ExitStatusSet *success_status) {
         if (code == CLD_EXITED)
                 return status == 0 ||
                        (success_status &&
-                       set_contains(success_status->code, INT_TO_PTR(status)));
+                       set_contains(success_status->status, INT_TO_PTR(status)));
 
         /* If a daemon does not implement handlers for some of the
          * signals that's not considered an unclean shutdown */
@@ -201,4 +207,19 @@ bool is_clean_exit_lsb(int code, int status, ExitStatusSet *success_status) {
         return
                 code == CLD_EXITED &&
                 (status == EXIT_NOTINSTALLED || status == EXIT_NOTCONFIGURED);
+}
+
+void exit_status_set_free(ExitStatusSet *x) {
+        assert(x);
+
+        set_free(x->status);
+        set_free(x->signal);
+        x->status = x->signal = NULL;
+}
+
+bool exit_status_set_is_empty(ExitStatusSet *x) {
+        if (!x)
+                return true;
+
+        return set_isempty(x->status) && set_isempty(x->signal);
 }

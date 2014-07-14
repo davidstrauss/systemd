@@ -38,6 +38,7 @@
 #include <sys/un.h>
 #include <sys/signalfd.h>
 #include <sys/epoll.h>
+#include <sys/mount.h>
 #include <sys/poll.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -46,6 +47,7 @@
 #include <sys/utsname.h>
 
 #include "udev.h"
+#include "udev-util.h"
 #include "sd-daemon.h"
 #include "cgroup-util.h"
 #include "dev-setup.h"
@@ -267,7 +269,7 @@ static void worker_new(struct event *event)
                         struct udev_event *udev_event;
                         struct worker_message msg;
                         int fd_lock = -1;
-                        int err;
+                        int err = 0;
 
                         log_debug("seq %llu running", udev_device_get_seqnum(dev));
                         udev_event = udev_event_new(dev);
@@ -290,7 +292,19 @@ static void worker_new(struct event *event)
                          * acquired the lock, the external process will block until
                          * udev has finished its event handling.
                          */
-                        if (streq_ptr("block", udev_device_get_subsystem(dev))) {
+
+                        /*
+                         * <kabi_> since we make check - device seems unused - we try
+                         *         ioctl to deactivate - and device is found to be opened
+                         * <kay> sure, you try to take a write lock
+                         * <kay> if you get it udev is out
+                         * <kay> if you can't get it, udev is busy
+                         * <kabi_> we cannot deactivate openned device  (as it is in-use)
+                         * <kay> maybe we should just exclude dm from that thing entirely
+                         * <kabi_> IMHO this sounds like a good plan for this moment
+                         */
+                        if (streq_ptr("block", udev_device_get_subsystem(dev)) &&
+                            !startswith(udev_device_get_sysname(dev), "dm-")) {
                                 struct udev_device *d = dev;
 
                                 if (streq_ptr("partition", udev_device_get_devtype(d)))
@@ -301,25 +315,24 @@ static void worker_new(struct event *event)
                                         if (fd_lock >= 0 && flock(fd_lock, LOCK_SH|LOCK_NB) < 0) {
                                                 log_debug("Unable to flock(%s), skipping event handling: %m", udev_device_get_devnode(d));
                                                 err = -EWOULDBLOCK;
+                                                fd_lock = safe_close(fd_lock);
                                                 goto skip;
                                         }
                                 }
                         }
 
                         /* apply rules, create node, symlinks */
-                        err = udev_event_execute_rules(udev_event, rules, &sigmask_orig);
+                        udev_event_execute_rules(udev_event, rules, &sigmask_orig);
 
-                        if (err == 0)
-                                udev_event_execute_run(udev_event, &sigmask_orig);
+                        udev_event_execute_run(udev_event, &sigmask_orig);
 
                         /* apply/restore inotify watch */
-                        if (err == 0 && udev_event->inotify_watch) {
+                        if (udev_event->inotify_watch) {
                                 udev_watch_begin(udev, dev);
                                 udev_device_update_db(dev);
                         }
 
-                        if (fd_lock >= 0)
-                                close(fd_lock);
+                        safe_close(fd_lock);
 
                         /* send processed event back to libudev listeners */
                         udev_monitor_send_device(worker_monitor, NULL, dev);
@@ -378,10 +391,8 @@ skip:
                 }
 out:
                 udev_device_unref(dev);
-                if (fd_signal >= 0)
-                        close(fd_signal);
-                if (fd_ep >= 0)
-                        close(fd_ep);
+                safe_close(fd_signal);
+                safe_close(fd_ep);
                 close(fd_inotify);
                 close(worker_watch[WRITE_END]);
                 udev_rules_unref(rules);
@@ -724,20 +735,125 @@ out:
         return udev_ctrl_connection_unref(ctrl_conn);
 }
 
-/* read inotify messages */
+static int synthesize_change(struct udev_device *dev) {
+        char filename[UTIL_PATH_SIZE];
+        int r;
+
+        if (streq_ptr("block", udev_device_get_subsystem(dev)) &&
+            streq_ptr("disk", udev_device_get_devtype(dev)) &&
+            !startswith(udev_device_get_sysname(dev), "dm-")) {
+                bool part_table_read = false;
+                bool has_partitions = false;
+                int fd;
+                struct udev *udev = udev_device_get_udev(dev);
+                _cleanup_udev_enumerate_unref_ struct udev_enumerate *e = NULL;
+                struct udev_list_entry *item;
+
+                /*
+                 * Try to re-read the partition table. This only succeeds if
+                 * none of the devices is busy. The kernel returns 0 if no
+                 * partition table is found, and we will not get an event for
+                 * the disk.
+                 */
+                fd = open(udev_device_get_devnode(dev), O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);
+                if (fd >= 0) {
+                        r = flock(fd, LOCK_EX|LOCK_NB);
+                        if (r >= 0)
+                                r = ioctl(fd, BLKRRPART, 0);
+
+                        close(fd);
+                        if (r >= 0)
+                                part_table_read = true;
+                }
+
+                /* search for partitions */
+                e = udev_enumerate_new(udev);
+                if (!e)
+                        return -ENOMEM;
+
+                r = udev_enumerate_add_match_parent(e, dev);
+                if (r < 0)
+                        return r;
+
+                r = udev_enumerate_add_match_subsystem(e, "block");
+                if (r < 0)
+                        return r;
+
+                r = udev_enumerate_scan_devices(e);
+                if (r < 0)
+                        return r;
+
+                udev_list_entry_foreach(item, udev_enumerate_get_list_entry(e)) {
+                        _cleanup_udev_device_unref_ struct udev_device *d = NULL;
+
+                        d = udev_device_new_from_syspath(udev, udev_list_entry_get_name(item));
+                        if (!d)
+                                continue;
+
+                        if (!streq_ptr("partition", udev_device_get_devtype(d)))
+                                continue;
+
+                        has_partitions = true;
+                        break;
+                }
+
+                /*
+                 * We have partitions and re-read the table, the kernel already sent
+                 * out a "change" event for the disk, and "remove/add" for all
+                 * partitions.
+                 */
+                if (part_table_read && has_partitions)
+                        return 0;
+
+                /*
+                 * We have partitions but re-reading the partition table did not
+                 * work, synthesize "change" for the disk and all partitions.
+                 */
+                log_debug("device %s closed, synthesising 'change'", udev_device_get_devnode(dev));
+                strscpyl(filename, sizeof(filename), udev_device_get_syspath(dev), "/uevent", NULL);
+                write_string_file(filename, "change");
+
+                udev_list_entry_foreach(item, udev_enumerate_get_list_entry(e)) {
+                        _cleanup_udev_device_unref_ struct udev_device *d = NULL;
+
+                        d = udev_device_new_from_syspath(udev, udev_list_entry_get_name(item));
+                        if (!d)
+                                continue;
+
+                        if (!streq_ptr("partition", udev_device_get_devtype(d)))
+                                continue;
+
+                        log_debug("device %s closed, synthesising partition '%s' 'change'",
+                                  udev_device_get_devnode(dev), udev_device_get_devnode(d));
+                        strscpyl(filename, sizeof(filename), udev_device_get_syspath(d), "/uevent", NULL);
+                        write_string_file(filename, "change");
+                }
+
+                return 0;
+        }
+
+        log_debug("device %s closed, synthesising 'change'", udev_device_get_devnode(dev));
+        strscpyl(filename, sizeof(filename), udev_device_get_syspath(dev), "/uevent", NULL);
+        write_string_file(filename, "change");
+
+        return 0;
+}
+
 static int handle_inotify(struct udev *udev)
 {
         int nbytes, pos;
         char *buf;
         struct inotify_event *ev;
+        int r;
 
-        if ((ioctl(fd_inotify, FIONREAD, &nbytes) < 0) || (nbytes <= 0))
-                return 0;
+        r = ioctl(fd_inotify, FIONREAD, &nbytes);
+        if (r < 0 || nbytes <= 0)
+                return -errno;
 
         buf = malloc(nbytes);
-        if (buf == NULL) {
+        if (!buf) {
                 log_error("error getting buffer for inotify");
-                return -1;
+                return -ENOMEM;
         }
 
         nbytes = read(fd_inotify, buf, nbytes);
@@ -747,27 +863,16 @@ static int handle_inotify(struct udev *udev)
 
                 ev = (struct inotify_event *)(buf + pos);
                 dev = udev_watch_lookup(udev, ev->wd);
-                if (dev != NULL) {
-                        log_debug("inotify event: %x for %s", ev->mask, udev_device_get_devnode(dev));
-                        if (ev->mask & IN_CLOSE_WRITE) {
-                                char filename[UTIL_PATH_SIZE];
-                                int fd;
+                if (!dev)
+                        continue;
 
-                                log_debug("device %s closed, synthesising 'change'", udev_device_get_devnode(dev));
-                                strscpyl(filename, sizeof(filename), udev_device_get_syspath(dev), "/uevent", NULL);
-                                fd = open(filename, O_WRONLY|O_CLOEXEC);
-                                if (fd >= 0) {
-                                        if (write(fd, "change", 6) < 0)
-                                                log_debug("error writing uevent: %m");
-                                        close(fd);
-                                }
-                        }
-                        if (ev->mask & IN_IGNORED)
-                                udev_watch_end(udev, dev);
+                log_debug("inotify event: %x for %s", ev->mask, udev_device_get_devnode(dev));
+                if (ev->mask & IN_CLOSE_WRITE)
+                        synthesize_change(dev);
+                else if (ev->mask & IN_IGNORED)
+                        udev_watch_end(udev, dev);
 
-                        udev_device_unref(dev);
-                }
-
+                udev_device_unref(dev);
         }
 
         free(buf);

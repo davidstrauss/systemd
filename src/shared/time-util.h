@@ -37,27 +37,28 @@ typedef struct dual_timestamp {
         usec_t monotonic;
 } dual_timestamp;
 
-#define MSEC_PER_SEC  1000ULL
-#define USEC_PER_SEC  1000000ULL
-#define USEC_PER_MSEC 1000ULL
-#define NSEC_PER_SEC  1000000000ULL
-#define NSEC_PER_MSEC 1000000ULL
-#define NSEC_PER_USEC 1000ULL
+#define MSEC_PER_SEC  ((usec_t) 1000ULL)
+#define USEC_PER_SEC  ((usec_t) 1000000ULL)
+#define USEC_PER_MSEC ((usec_t) 1000ULL)
+#define NSEC_PER_SEC  ((usec_t) 1000000000ULL)
+#define NSEC_PER_MSEC ((usec_t) 1000000ULL)
+#define NSEC_PER_USEC ((usec_t) 1000ULL)
 
-#define USEC_PER_MINUTE (60ULL*USEC_PER_SEC)
-#define NSEC_PER_MINUTE (60ULL*NSEC_PER_SEC)
-#define USEC_PER_HOUR (60ULL*USEC_PER_MINUTE)
-#define NSEC_PER_HOUR (60ULL*NSEC_PER_MINUTE)
-#define USEC_PER_DAY (24ULL*USEC_PER_HOUR)
-#define NSEC_PER_DAY (24ULL*NSEC_PER_HOUR)
-#define USEC_PER_WEEK (7ULL*USEC_PER_DAY)
-#define NSEC_PER_WEEK (7ULL*NSEC_PER_DAY)
-#define USEC_PER_MONTH (2629800ULL*USEC_PER_SEC)
-#define NSEC_PER_MONTH (2629800ULL*NSEC_PER_SEC)
-#define USEC_PER_YEAR (31557600ULL*USEC_PER_SEC)
-#define NSEC_PER_YEAR (31557600ULL*NSEC_PER_SEC)
+#define USEC_PER_MINUTE ((usec_t) (60ULL*USEC_PER_SEC))
+#define NSEC_PER_MINUTE ((usec_t) (60ULL*NSEC_PER_SEC))
+#define USEC_PER_HOUR ((usec_t) (60ULL*USEC_PER_MINUTE))
+#define NSEC_PER_HOUR ((usec_t) (60ULL*NSEC_PER_MINUTE))
+#define USEC_PER_DAY ((usec_t) (24ULL*USEC_PER_HOUR))
+#define NSEC_PER_DAY ((usec_t) (24ULL*NSEC_PER_HOUR))
+#define USEC_PER_WEEK ((usec_t) (7ULL*USEC_PER_DAY))
+#define NSEC_PER_WEEK ((usec_t) (7ULL*NSEC_PER_DAY))
+#define USEC_PER_MONTH ((usec_t) (2629800ULL*USEC_PER_SEC))
+#define NSEC_PER_MONTH ((usec_t) (2629800ULL*NSEC_PER_SEC))
+#define USEC_PER_YEAR ((usec_t) (31557600ULL*USEC_PER_SEC))
+#define NSEC_PER_YEAR ((usec_t) (31557600ULL*NSEC_PER_SEC))
 
 #define FORMAT_TIMESTAMP_MAX ((4*4+1)+11+9+4+1) /* weekdays can be unicode */
+#define FORMAT_TIMESTAMP_WIDTH 28 /* when outputting, assume this width */
 #define FORMAT_TIMESTAMP_RELATIVE_MAX 256
 #define FORMAT_TIMESPAN_MAX 64
 
@@ -94,3 +95,6 @@ int parse_sec(const char *t, usec_t *usec);
 int parse_nsec(const char *t, nsec_t *nsec);
 
 bool ntp_synced(void);
+
+int get_timezones(char ***l);
+bool timezone_is_valid(const char *name);

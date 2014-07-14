@@ -335,7 +335,7 @@ static int output_short(
                         r = strftime(buf, sizeof(buf), "%b %d %H:%M:%S", localtime_r(&t, &tm));
                         if (r > 0) {
                                 snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf),
-                                         ".%06llu", x % USEC_PER_SEC);
+                                         ".%06llu", (unsigned long long) (x % USEC_PER_SEC));
                         }
                         break;
                 default:
@@ -531,12 +531,12 @@ static int output_export(
 
         fprintf(f,
                 "__CURSOR=%s\n"
-                "__REALTIME_TIMESTAMP=%llu\n"
-                "__MONOTONIC_TIMESTAMP=%llu\n"
+                "__REALTIME_TIMESTAMP="USEC_FMT"\n"
+                "__MONOTONIC_TIMESTAMP="USEC_FMT"\n"
                 "_BOOT_ID=%s\n",
                 cursor,
-                (unsigned long long) realtime,
-                (unsigned long long) monotonic,
+                realtime,
+                monotonic,
                 sd_id128_to_string(boot_id, sid));
 
         JOURNAL_FOREACH_DATA_RETVAL(j, data, length, r) {
@@ -673,12 +673,12 @@ static int output_json(
                 fprintf(f,
                         "{\n"
                         "\t\"__CURSOR\" : \"%s\",\n"
-                        "\t\"__REALTIME_TIMESTAMP\" : \"%llu\",\n"
-                        "\t\"__MONOTONIC_TIMESTAMP\" : \"%llu\",\n"
+                        "\t\"__REALTIME_TIMESTAMP\" : \""USEC_FMT"\",\n"
+                        "\t\"__MONOTONIC_TIMESTAMP\" : \""USEC_FMT"\",\n"
                         "\t\"_BOOT_ID\" : \"%s\"",
                         cursor,
-                        (unsigned long long) realtime,
-                        (unsigned long long) monotonic,
+                        realtime,
+                        monotonic,
                         sd_id128_to_string(boot_id, sid));
         else {
                 if (mode == OUTPUT_JSON_SSE)
@@ -686,12 +686,12 @@ static int output_json(
 
                 fprintf(f,
                         "{ \"__CURSOR\" : \"%s\", "
-                        "\"__REALTIME_TIMESTAMP\" : \"%llu\", "
-                        "\"__MONOTONIC_TIMESTAMP\" : \"%llu\", "
+                        "\"__REALTIME_TIMESTAMP\" : \""USEC_FMT"\", "
+                        "\"__MONOTONIC_TIMESTAMP\" : \""USEC_FMT"\", "
                         "\"_BOOT_ID\" : \"%s\"",
                         cursor,
-                        (unsigned long long) realtime,
-                        (unsigned long long) monotonic,
+                        realtime,
+                        monotonic,
                         sd_id128_to_string(boot_id, sid));
         }
 
@@ -1100,7 +1100,7 @@ int add_matches_for_user_unit(sd_journal *j, const char *unit, uid_t uid) {
         m2 = strappenda("USER_UNIT=", unit);
         m3 = strappenda("COREDUMP_USER_UNIT=", unit);
         m4 = strappenda("OBJECT_SYSTEMD_USER_UNIT=", unit);
-        sprintf(muid, "_UID=%lu", (unsigned long) uid);
+        sprintf(muid, "_UID="UID_FMT, uid);
 
         (void) (
                 /* Look for messages from the user service itself */
@@ -1158,7 +1158,7 @@ static int get_boot_id_for_machine(const char *machine, sd_id128_t *boot_id) {
         if (r < 0)
                 return r;
 
-        r = namespace_open(pid, &pidnsfd, &mntnsfd, &rootfd);
+        r = namespace_open(pid, &pidnsfd, &mntnsfd, NULL, &rootfd);
         if (r < 0)
                 return r;
 
@@ -1174,7 +1174,7 @@ static int get_boot_id_for_machine(const char *machine, sd_id128_t *boot_id) {
 
                 pair[0] = safe_close(pair[0]);
 
-                r = namespace_enter(pidnsfd, mntnsfd, rootfd);
+                r = namespace_enter(pidnsfd, mntnsfd, -1, rootfd);
                 if (r < 0)
                         _exit(EXIT_FAILURE);
 

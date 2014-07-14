@@ -84,13 +84,21 @@
 #include "def.h"
 #include "rtnl-util.h"
 #include "udev-util.h"
+#include "eventfd-util.h"
 #include "blkid-util.h"
 #include "gpt.h"
 #include "siphash24.h"
+#include "copy.h"
+#include "base-filesystem.h"
 
 #ifdef HAVE_SECCOMP
 #include "seccomp-util.h"
 #endif
+
+typedef enum ContainerStatus {
+        CONTAINER_TERMINATED,
+        CONTAINER_REBOOTED
+} ContainerStatus;
 
 typedef enum LinkJournal {
         LINK_NO,
@@ -98,6 +106,12 @@ typedef enum LinkJournal {
         LINK_HOST,
         LINK_GUEST
 } LinkJournal;
+
+typedef enum Volatile {
+        VOLATILE_NO,
+        VOLATILE_YES,
+        VOLATILE_STATE,
+} Volatile;
 
 static char *arg_directory = NULL;
 static char *arg_user = NULL;
@@ -139,6 +153,7 @@ static uint64_t arg_retain =
         (1ULL << CAP_MKNOD);
 static char **arg_bind = NULL;
 static char **arg_bind_ro = NULL;
+static char **arg_tmpfs = NULL;
 static char **arg_setenv = NULL;
 static bool arg_quiet = false;
 static bool arg_share_system = false;
@@ -150,6 +165,7 @@ static bool arg_network_veth = false;
 static const char *arg_network_bridge = NULL;
 static unsigned long arg_personality = 0xffffffffLU;
 static const char *arg_image = NULL;
+static Volatile arg_volatile = VOLATILE_NO;
 
 static int help(void) {
 
@@ -193,11 +209,13 @@ static int help(void) {
                "     --bind=PATH[:PATH]     Bind mount a file or directory from the host into\n"
                "                            the container\n"
                "     --bind-ro=PATH[:PATH]  Similar, but creates a read-only bind mount\n"
+               "     --tmpfs=PATH:[OPTIONS] Mount an empty tmpfs to the specified directory\n"
                "     --setenv=NAME=VALUE    Pass an environment variable to PID 1\n"
                "     --share-system         Share system namespaces with host\n"
                "     --register=BOOLEAN     Register container as machine\n"
                "     --keep-unit            Do not register a scope for the machine, reuse\n"
-               "                            the service unit nspawn is running in\n",
+               "                            the service unit nspawn is running in\n"
+               "     --volatile[=MODE]      Run the system in volatile mode\n",
                program_invocation_short_name);
 
         return 0;
@@ -215,6 +233,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_LINK_JOURNAL,
                 ARG_BIND,
                 ARG_BIND_RO,
+                ARG_TMPFS,
                 ARG_SETENV,
                 ARG_SHARE_SYSTEM,
                 ARG_REGISTER,
@@ -224,6 +243,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_NETWORK_VETH,
                 ARG_NETWORK_BRIDGE,
                 ARG_PERSONALITY,
+                ARG_VOLATILE,
         };
 
         static const struct option options[] = {
@@ -240,6 +260,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "link-journal",          required_argument, NULL, ARG_LINK_JOURNAL      },
                 { "bind",                  required_argument, NULL, ARG_BIND              },
                 { "bind-ro",               required_argument, NULL, ARG_BIND_RO           },
+                { "tmpfs",                 required_argument, NULL, ARG_TMPFS             },
                 { "machine",               required_argument, NULL, 'M'                   },
                 { "slice",                 required_argument, NULL, 'S'                   },
                 { "setenv",                required_argument, NULL, ARG_SETENV            },
@@ -255,6 +276,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "network-bridge",        required_argument, NULL, ARG_NETWORK_BRIDGE    },
                 { "personality",           required_argument, NULL, ARG_PERSONALITY       },
                 { "image",                 required_argument, NULL, 'i'                   },
+                { "volatile",              optional_argument, NULL, ARG_VOLATILE          },
                 {}
         };
 
@@ -462,6 +484,42 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
                 }
 
+                case ARG_TMPFS: {
+                        _cleanup_free_ char *a = NULL, *b = NULL;
+                        char *e;
+
+                        e = strchr(optarg, ':');
+                        if (e) {
+                                a = strndup(optarg, e - optarg);
+                                b = strdup(e + 1);
+                        } else {
+                                a = strdup(optarg);
+                                b = strdup("mode=0755");
+                        }
+
+                        if (!a || !b)
+                                return log_oom();
+
+                        if (!path_is_absolute(a)) {
+                                log_error("Invalid tmpfs specification: %s", optarg);
+                                return -EINVAL;
+                        }
+
+                        r = strv_push(&arg_tmpfs, a);
+                        if (r < 0)
+                                return log_oom();
+
+                        a = NULL;
+
+                        r = strv_push(&arg_tmpfs, b);
+                        if (r < 0)
+                                return log_oom();
+
+                        b = NULL;
+
+                        break;
+                }
+
                 case ARG_SETENV: {
                         char **n;
 
@@ -511,6 +569,25 @@ static int parse_argv(int argc, char *argv[]) {
 
                         break;
 
+                case ARG_VOLATILE:
+
+                        if (!optarg)
+                                arg_volatile = VOLATILE_YES;
+                        else {
+                                r = parse_boolean(optarg);
+                                if (r < 0) {
+                                        if (streq(optarg, "state"))
+                                                arg_volatile = VOLATILE_STATE;
+                                        else {
+                                                log_error("Failed to parse --volatile= argument: %s", optarg);
+                                                return r;
+                                        }
+                                } else
+                                        arg_volatile = r ? VOLATILE_YES : VOLATILE_NO;
+                        }
+
+                        break;
+
                 case '?':
                         return -EINVAL;
 
@@ -537,6 +614,11 @@ static int parse_argv(int argc, char *argv[]) {
                 return -EINVAL;
         }
 
+        if (arg_volatile != VOLATILE_NO && arg_read_only) {
+                log_error("Cannot combine --read-only with --volatile. Note that --volatile already implies a read-only base hierarchy.");
+                return -EINVAL;
+        }
+
         arg_retain = (arg_retain | plus | (arg_private_network ? 1ULL << CAP_NET_ADMIN : 0)) & ~minus;
 
         return 1;
@@ -554,17 +636,17 @@ static int mount_all(const char *dest) {
         } MountPoint;
 
         static const MountPoint mount_table[] = {
-                { "proc",      "/proc",     "proc",  NULL,       MS_NOSUID|MS_NOEXEC|MS_NODEV, true  },
-                { "/proc/sys", "/proc/sys", NULL,    NULL,       MS_BIND, true                       },   /* Bind mount first */
-                { NULL,        "/proc/sys", NULL,    NULL,       MS_BIND|MS_RDONLY|MS_REMOUNT, true  },   /* Then, make it r/o */
-                { "sysfs",     "/sys",      "sysfs", NULL,       MS_RDONLY|MS_NOSUID|MS_NOEXEC|MS_NODEV, true  },
-                { "tmpfs",     "/dev",      "tmpfs", "mode=755", MS_NOSUID|MS_STRICTATIME,     true  },
+                { "proc",      "/proc",     "proc",  NULL,        MS_NOSUID|MS_NOEXEC|MS_NODEV,           true  },
+                { "/proc/sys", "/proc/sys", NULL,    NULL,        MS_BIND,                                true  },   /* Bind mount first */
+                { NULL,        "/proc/sys", NULL,    NULL,        MS_BIND|MS_RDONLY|MS_REMOUNT,           true  },   /* Then, make it r/o */
+                { "sysfs",     "/sys",      "sysfs", NULL,        MS_RDONLY|MS_NOSUID|MS_NOEXEC|MS_NODEV, true  },
+                { "tmpfs",     "/dev",      "tmpfs", "mode=755",  MS_NOSUID|MS_STRICTATIME,               true  },
                 { "devpts",    "/dev/pts",  "devpts","newinstance,ptmxmode=0666,mode=620,gid=" STRINGIFY(TTY_GID), MS_NOSUID|MS_NOEXEC, true },
-                { "tmpfs",     "/dev/shm",  "tmpfs", "mode=1777", MS_NOSUID|MS_NODEV|MS_STRICTATIME, true  },
-                { "tmpfs",     "/run",      "tmpfs", "mode=755", MS_NOSUID|MS_NODEV|MS_STRICTATIME, true  },
+                { "tmpfs",     "/dev/shm",  "tmpfs", "mode=1777", MS_NOSUID|MS_NODEV|MS_STRICTATIME,      true  },
+                { "tmpfs",     "/run",      "tmpfs", "mode=755",  MS_NOSUID|MS_NODEV|MS_STRICTATIME,      true  },
 #ifdef HAVE_SELINUX
-                { "/sys/fs/selinux", "/sys/fs/selinux", NULL, NULL, MS_BIND,                      false },  /* Bind mount first */
-                { NULL,              "/sys/fs/selinux", NULL, NULL, MS_BIND|MS_RDONLY|MS_REMOUNT, false },  /* Then, make it r/o */
+                { "/sys/fs/selinux", "/sys/fs/selinux", NULL, NULL, MS_BIND,                              false },  /* Bind mount first */
+                { NULL,              "/sys/fs/selinux", NULL, NULL, MS_BIND|MS_RDONLY|MS_REMOUNT,         false },  /* Then, make it r/o */
 #endif
         };
 
@@ -629,11 +711,11 @@ static int mount_all(const char *dest) {
         return r;
 }
 
-static int mount_binds(const char *dest, char **l, unsigned long flags) {
+static int mount_binds(const char *dest, char **l, bool ro) {
         char **x, **y;
 
         STRV_FOREACH_PAIR(x, y, l) {
-                char *where;
+                _cleanup_free_ char *where = NULL;
                 struct stat source_st, dest_st;
                 int r;
 
@@ -642,12 +724,14 @@ static int mount_binds(const char *dest, char **l, unsigned long flags) {
                         return -errno;
                 }
 
-                where = strappenda(dest, *y);
+                where = strappend(dest, *y);
+                if (!where)
+                        return log_oom();
+
                 r = stat(where, &dest_st);
                 if (r == 0) {
                         if ((source_st.st_mode & S_IFMT) != (dest_st.st_mode & S_IFMT)) {
-                                log_error("The file types of %s and %s do not match. Refusing bind mount",
-                                                *x, where);
+                                log_error("The file types of %s and %s do not match. Refusing bind mount", *x, where);
                                 return -EINVAL;
                         }
                 } else if (errno == ENOENT) {
@@ -657,11 +741,12 @@ static int mount_binds(const char *dest, char **l, unsigned long flags) {
                                 return r;
                         }
                 } else {
-                        log_error("Failed to bind mount %s: %s", *x, strerror(errno));
+                        log_error("Failed to bind mount %s: %m", *x);
                         return -errno;
                 }
+
                 /* Create the mount point, but be conservative -- refuse to create block
-                * and char devices. */
+                 * and char devices. */
                 if (S_ISDIR(source_st.st_mode))
                         mkdir_label(where, 0755);
                 else if (S_ISFIFO(source_st.st_mode))
@@ -680,8 +765,32 @@ static int mount_binds(const char *dest, char **l, unsigned long flags) {
                         return -errno;
                 }
 
-                if (flags && mount(NULL, where, NULL, MS_REMOUNT|MS_BIND|flags, NULL) < 0) {
-                        log_error("mount(%s) failed: %m", where);
+                if (ro) {
+                        r = bind_remount_recursive(where, true);
+                        if (r < 0) {
+                                log_error("Read-Only bind mount failed: %s", strerror(-r));
+                                return r;
+                        }
+                }
+        }
+
+        return 0;
+}
+
+static int mount_tmpfs(const char *dest) {
+        char **i, **o;
+
+        STRV_FOREACH_PAIR(i, o, arg_tmpfs) {
+                _cleanup_free_ char *where = NULL;
+
+                where = strappend(dest, *i);
+                if (!where)
+                        return log_oom();
+
+                mkdir_label(where, 0755);
+
+                if (mount("tmpfs", where, "tmpfs", MS_NODEV|MS_STRICTATIME, *o) < 0) {
+                        log_error("tmpfs mount to %s failed: %m", where);
                         return -errno;
                 }
         }
@@ -721,7 +830,6 @@ static int setup_timezone(const char *dest) {
                 if (!y)
                         y = path_startswith(q, "/usr/share/zoneinfo/");
 
-
                 /* Already pointing to the right place? Then do nothing .. */
                 if (y && streq(y, z))
                         return 0;
@@ -740,7 +848,9 @@ static int setup_timezone(const char *dest) {
         if (!what)
                 return log_oom();
 
+        mkdir_parents(where, 0755);
         unlink(where);
+
         if (symlink(what, where) < 0) {
                 log_error("Failed to correct timezone of container: %m");
                 return 0;
@@ -750,7 +860,7 @@ static int setup_timezone(const char *dest) {
 }
 
 static int setup_resolv_conf(const char *dest) {
-        char _cleanup_free_ *where = NULL;
+        _cleanup_free_ char *where = NULL;
 
         assert(dest);
 
@@ -764,9 +874,112 @@ static int setup_resolv_conf(const char *dest) {
 
         /* We don't really care for the results of this really. If it
          * fails, it fails, but meh... */
-        copy_file("/etc/resolv.conf", where, O_TRUNC|O_NOFOLLOW);
+        mkdir_parents(where, 0755);
+        copy_file("/etc/resolv.conf", where, O_TRUNC|O_NOFOLLOW, 0644);
 
         return 0;
+}
+
+static int setup_volatile_state(const char *directory) {
+        const char *p;
+        int r;
+
+        assert(directory);
+
+        if (arg_volatile != VOLATILE_STATE)
+                return 0;
+
+        /* --volatile=state means we simply overmount /var
+           with a tmpfs, and the rest read-only. */
+
+        r = bind_remount_recursive(directory, true);
+        if (r < 0) {
+                log_error("Failed to remount %s read-only: %s", directory, strerror(-r));
+                return r;
+        }
+
+        p = strappenda(directory, "/var");
+        mkdir(p, 0755);
+
+        if (mount("tmpfs", p, "tmpfs", MS_STRICTATIME, "mode=755") < 0) {
+                log_error("Failed to mount tmpfs to /var: %m");
+                return -errno;
+        }
+
+        return 0;
+}
+
+static int setup_volatile(const char *directory) {
+        bool tmpfs_mounted = false, bind_mounted = false;
+        char template[] = "/tmp/nspawn-volatile-XXXXXX";
+        const char *f, *t;
+        int r;
+
+        assert(directory);
+
+        if (arg_volatile != VOLATILE_YES)
+                return 0;
+
+        /* --volatile=yes means we mount a tmpfs to the root dir, and
+           the original /usr to use inside it, and that read-only. */
+
+        if (!mkdtemp(template)) {
+                log_error("Failed to create temporary directory: %m");
+                return -errno;
+        }
+
+        if (mount("tmpfs", template, "tmpfs", MS_STRICTATIME, "mode=755") < 0) {
+                log_error("Failed to mount tmpfs for root directory: %m");
+                r = -errno;
+                goto fail;
+        }
+
+        tmpfs_mounted = true;
+
+        f = strappenda(directory, "/usr");
+        t = strappenda(template, "/usr");
+
+        mkdir(t, 0755);
+        if (mount(f, t, "bind", MS_BIND|MS_REC, NULL) < 0) {
+                log_error("Failed to create /usr bind mount: %m");
+                r = -errno;
+                goto fail;
+        }
+
+        bind_mounted = true;
+
+        r = bind_remount_recursive(t, true);
+        if (r < 0) {
+                log_error("Failed to remount %s read-only: %s", t, strerror(-r));
+                goto fail;
+        }
+
+        if (mount(template, directory, NULL, MS_MOVE, NULL) < 0) {
+                log_error("Failed to move root mount: %m");
+                r = -errno;
+                goto fail;
+        }
+
+        rmdir(template);
+
+        return 0;
+
+fail:
+        if (bind_mounted)
+                umount(t);
+        if (tmpfs_mounted)
+                umount(template);
+        rmdir(template);
+        return r;
+}
+
+static char* id128_format_as_uuid(sd_id128_t id, char s[37]) {
+
+        snprintf(s, 37,
+                 "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                 SD_ID128_FORMAT_VAL(id));
+
+        return s;
 }
 
 static int setup_boot_id(const char *dest) {
@@ -794,10 +1007,7 @@ static int setup_boot_id(const char *dest) {
                 return r;
         }
 
-        snprintf(as_uuid, sizeof(as_uuid),
-                 "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                 SD_ID128_FORMAT_VAL(rnd));
-        char_array_0(as_uuid);
+        id128_format_as_uuid(rnd, as_uuid);
 
         r = write_string_file(from, as_uuid);
         if (r < 0) {
@@ -1137,10 +1347,8 @@ static int setup_journal(const char *directory) {
         } else if (access(p, F_OK) < 0)
                 return 0;
 
-        if (dir_is_empty(q) == 0) {
-                log_error("%s not empty.", q);
-                return -ENOTEMPTY;
-        }
+        if (dir_is_empty(q) == 0)
+                log_warning("%s is not empty, proceeding anyway.", q);
 
         r = mkdir_p(q, 0755);
         if (r < 0) {
@@ -1180,7 +1388,7 @@ static int drop_capabilities(void) {
         return capability_bounding_set_drop(~arg_retain, false);
 }
 
-static int register_machine(pid_t pid) {
+static int register_machine(pid_t pid, int local_ifindex) {
         _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_bus_unref_ sd_bus *bus = NULL;
         int r;
@@ -1200,16 +1408,17 @@ static int register_machine(pid_t pid) {
                                 "org.freedesktop.machine1",
                                 "/org/freedesktop/machine1",
                                 "org.freedesktop.machine1.Manager",
-                                "RegisterMachine",
+                                "RegisterMachineWithNetwork",
                                 &error,
                                 NULL,
-                                "sayssus",
+                                "sayssusai",
                                 arg_machine,
                                 SD_BUS_MESSAGE_APPEND_ID128(arg_uuid),
                                 "nspawn",
                                 "container",
                                 (uint32_t) pid,
-                                strempty(arg_directory));
+                                strempty(arg_directory),
+                                local_ifindex > 0 ? 1 : 0, local_ifindex);
         } else {
                 _cleanup_bus_message_unref_ sd_bus_message *m = NULL;
 
@@ -1219,7 +1428,7 @@ static int register_machine(pid_t pid) {
                                 "org.freedesktop.machine1",
                                 "/org/freedesktop/machine1",
                                 "org.freedesktop.machine1.Manager",
-                                "CreateMachine");
+                                "CreateMachineWithNetwork");
                 if (r < 0) {
                         log_error("Failed to create message: %s", strerror(-r));
                         return r;
@@ -1227,13 +1436,14 @@ static int register_machine(pid_t pid) {
 
                 r = sd_bus_message_append(
                                 m,
-                                "sayssus",
+                                "sayssusai",
                                 arg_machine,
                                 SD_BUS_MESSAGE_APPEND_ID128(arg_uuid),
                                 "nspawn",
                                 "container",
                                 (uint32_t) pid,
-                                strempty(arg_directory));
+                                strempty(arg_directory),
+                                local_ifindex > 0 ? 1 : 0, local_ifindex);
                 if (r < 0) {
                         log_error("Failed to append message arguments: %s", strerror(-r));
                         return r;
@@ -1436,11 +1646,11 @@ static int get_mac(struct ether_addr *mac) {
         return 0;
 }
 
-static int setup_veth(pid_t pid, char iface_name[IFNAMSIZ]) {
+static int setup_veth(pid_t pid, char iface_name[IFNAMSIZ], int *ifi) {
         _cleanup_rtnl_message_unref_ sd_rtnl_message *m = NULL;
         _cleanup_rtnl_unref_ sd_rtnl *rtnl = NULL;
         struct ether_addr mac;
-        int r;
+        int r, i;
 
         if (!arg_private_network)
                 return 0;
@@ -1540,10 +1750,18 @@ static int setup_veth(pid_t pid, char iface_name[IFNAMSIZ]) {
                 return r;
         }
 
+        i = (int) if_nametoindex(iface_name);
+        if (i <= 0) {
+                log_error("Failed to resolve interface %s: %m", iface_name);
+                return -errno;
+        }
+
+        *ifi = i;
+
         return 0;
 }
 
-static int setup_bridge(const char veth_name[]) {
+static int setup_bridge(const char veth_name[], int *ifi) {
         _cleanup_rtnl_message_unref_ sd_rtnl_message *m = NULL;
         _cleanup_rtnl_unref_ sd_rtnl *rtnl = NULL;
         int r, bridge;
@@ -1562,6 +1780,8 @@ static int setup_bridge(const char veth_name[]) {
                 log_error("Failed to resolve interface %s: %m", arg_network_bridge);
                 return -errno;
         }
+
+        *ifi = bridge;
 
         r = sd_rtnl_open(&rtnl, 0);
         if (r < 0) {
@@ -1785,21 +2005,24 @@ static int setup_macvlan(pid_t pid) {
         return 0;
 }
 
-static int audit_still_doesnt_work_in_containers(void) {
+static int setup_seccomp(void) {
 
 #ifdef HAVE_SECCOMP
+        static const int blacklist[] = {
+                SCMP_SYS(kexec_load),
+                SCMP_SYS(open_by_handle_at),
+                SCMP_SYS(init_module),
+                SCMP_SYS(finit_module),
+                SCMP_SYS(delete_module),
+                SCMP_SYS(iopl),
+                SCMP_SYS(ioperm),
+                SCMP_SYS(swapon),
+                SCMP_SYS(swapoff),
+        };
+
         scmp_filter_ctx seccomp;
+        unsigned i;
         int r;
-
-        /*
-           Audit is broken in containers, much of the userspace audit
-           hookup will fail if running inside a container. We don't
-           care and just turn off creation of audit sockets.
-
-           This will make socket(AF_NETLINK, *, NETLINK_AUDIT) fail
-           with EAFNOSUPPORT which audit userspace uses as indication
-           that audit is disabled in the kernel.
-         */
 
         seccomp = seccomp_init(SCMP_ACT_ALLOW);
         if (!seccomp)
@@ -1810,6 +2033,26 @@ static int audit_still_doesnt_work_in_containers(void) {
                 log_error("Failed to add secondary archs to seccomp filter: %s", strerror(-r));
                 goto finish;
         }
+
+        for (i = 0; i < ELEMENTSOF(blacklist); i++) {
+                r = seccomp_rule_add(seccomp, SCMP_ACT_ERRNO(EPERM), blacklist[i], 0);
+                if (r == -EFAULT)
+                        continue; /* unknown syscall */
+                if (r < 0) {
+                        log_error("Failed to block syscall: %s", strerror(-r));
+                        goto finish;
+                }
+        }
+
+        /*
+           Audit is broken in containers, much of the userspace audit
+           hookup will fail if running inside a container. We don't
+           care and just turn off creation of audit sockets.
+
+           This will make socket(AF_NETLINK, *, NETLINK_AUDIT) fail
+           with EAFNOSUPPORT which audit userspace uses as indication
+           that audit is disabled in the kernel.
+         */
 
         r = seccomp_rule_add(
                         seccomp,
@@ -2565,6 +2808,86 @@ static int change_uid_gid(char **_home) {
         return 0;
 }
 
+/*
+ * Return values:
+ * < 0 : wait_for_terminate() failed to get the state of the
+ *       container, the container was terminated by a signal, or
+ *       failed for an unknown reason.  No change is made to the
+ *       container argument.
+ * > 0 : The program executed in the container terminated with an
+ *       error.  The exit code of the program executed in the
+ *       container is returned.  No change is made to the container
+ *       argument.
+ *   0 : The container is being rebooted, has been shut down or exited
+ *       successfully.  The container argument has been set to either
+ *       CONTAINER_TERMINATED or CONTAINER_REBOOTED.
+ *
+ * That is, success is indicated by a return value of zero, and an
+ * error is indicated by a non-zero value.
+ */
+static int wait_for_container(pid_t pid, ContainerStatus *container) {
+        int r;
+        siginfo_t status;
+
+        r = wait_for_terminate(pid, &status);
+        if (r < 0) {
+                log_warning("Failed to wait for container: %s", strerror(-r));
+                return r;
+        }
+
+        switch (status.si_code) {
+        case CLD_EXITED:
+                r = status.si_status;
+                if (r == 0) {
+                        if (!arg_quiet)
+                                log_debug("Container %s exited successfully.",
+                                          arg_machine);
+
+                        *container = CONTAINER_TERMINATED;
+                } else {
+                        log_error("Container %s failed with error code %i.",
+                                  arg_machine, status.si_status);
+                }
+                break;
+
+        case CLD_KILLED:
+                if (status.si_status == SIGINT) {
+                        if (!arg_quiet)
+                                log_info("Container %s has been shut down.",
+                                         arg_machine);
+
+                        *container = CONTAINER_TERMINATED;
+                        r = 0;
+                        break;
+                } else if (status.si_status == SIGHUP) {
+                        if (!arg_quiet)
+                                log_info("Container %s is being rebooted.",
+                                         arg_machine);
+
+                        *container = CONTAINER_REBOOTED;
+                        r = 0;
+                        break;
+                }
+                /* CLD_KILLED fallthrough */
+
+        case CLD_DUMPED:
+                log_error("Container %s terminated by signal %s.",
+                          arg_machine, signal_to_string(status.si_status));
+                r = -1;
+                break;
+
+        default:
+                log_error("Container %s failed due to unknown reason.",
+                          arg_machine);
+                r = -1;
+                break;
+        }
+
+        return r;
+}
+
+static void nop_handler(int sig) {}
+
 int main(int argc, char *argv[]) {
 
         _cleanup_free_ char *kdbus_domain = NULL, *device_path = NULL, *root_device = NULL, *home_device = NULL, *srv_device = NULL;
@@ -2576,8 +2899,8 @@ int main(int argc, char *argv[]) {
         const char *console = NULL;
         char veth_name[IFNAMSIZ];
         bool secondary = false;
+        sigset_t mask, mask_chld;
         pid_t pid = 0;
-        sigset_t mask;
 
         log_parse_environment();
         log_open();
@@ -2651,7 +2974,7 @@ int main(int argc, char *argv[]) {
 
                 if (arg_boot) {
                         if (path_is_os_tree(arg_directory) <= 0) {
-                                log_error("Directory %s doesn't look like an OS root directory (/etc/os-release is missing). Refusing.", arg_directory);
+                                log_error("Directory %s doesn't look like an OS root directory (os-release file is missing). Refusing.", arg_directory);
                                 goto finish;
                         }
                 } else {
@@ -2686,7 +3009,11 @@ int main(int argc, char *argv[]) {
                         goto finish;
                 }
 
-                r = dissect_image(image_fd, &root_device, &root_device_rw, &home_device, &home_device_rw, &srv_device, &srv_device_rw, &secondary);
+                r = dissect_image(image_fd,
+                                  &root_device, &root_device_rw,
+                                  &home_device, &home_device_rw,
+                                  &srv_device, &srv_device_rw,
+                                  &secondary);
                 if (r < 0)
                         goto finish;
         }
@@ -2704,7 +3031,8 @@ int main(int argc, char *argv[]) {
         }
 
         if (!arg_quiet)
-                log_info("Spawning container %s on %s. Press ^] three times within 1s to abort execution.", arg_machine, arg_image ? arg_image : arg_directory);
+                log_info("Spawning container %s on %s.\nPress ^] three times within 1s to kill container.",
+                         arg_machine, arg_image ? arg_image : arg_directory);
 
         if (unlockpt(master) < 0) {
                 log_error("Failed to unlock tty: %m");
@@ -2739,36 +3067,44 @@ int main(int argc, char *argv[]) {
         sd_notify(0, "READY=1");
 
         assert_se(sigemptyset(&mask) == 0);
+        assert_se(sigemptyset(&mask_chld) == 0);
+        sigaddset(&mask_chld, SIGCHLD);
         sigset_add_many(&mask, SIGCHLD, SIGWINCH, SIGTERM, SIGINT, -1);
         assert_se(sigprocmask(SIG_BLOCK, &mask, NULL) == 0);
 
         for (;;) {
-                int parent_ready_fd = -1, child_ready_fd = -1;
-                siginfo_t status;
-                eventfd_t x;
+                ContainerStatus container_status;
+                int eventfds[2] = { -1, -1 };
+                struct sigaction sa = {
+                        .sa_handler = nop_handler,
+                        .sa_flags = SA_NOCLDSTOP,
+                };
 
-                parent_ready_fd = eventfd(0, EFD_CLOEXEC);
-                if (parent_ready_fd < 0) {
-                        log_error("Failed to create event fd: %m");
+                /* Child can be killed before execv(), so handle SIGCHLD
+                 * in order to interrupt parent's blocking calls and
+                 * give it a chance to call wait() and terminate. */
+                r = sigprocmask(SIG_UNBLOCK, &mask_chld, NULL);
+                if (r < 0) {
+                        log_error("Failed to change the signal mask: %m");
                         goto finish;
                 }
 
-                child_ready_fd = eventfd(0, EFD_CLOEXEC);
-                if (child_ready_fd < 0) {
-                        log_error("Failed to create event fd: %m");
+                r = sigaction(SIGCHLD, &sa, NULL);
+                if (r < 0) {
+                        log_error("Failed to install SIGCHLD handler: %m");
                         goto finish;
                 }
 
-                pid = syscall(__NR_clone,
-                              SIGCHLD|CLONE_NEWNS|
-                              (arg_share_system ? 0 : CLONE_NEWIPC|CLONE_NEWPID|CLONE_NEWUTS)|
-                              (arg_private_network ? CLONE_NEWNET : 0), NULL);
+                pid = clone_with_eventfd(SIGCHLD|CLONE_NEWNS|
+                                         (arg_share_system ? 0 : CLONE_NEWIPC|CLONE_NEWPID|CLONE_NEWUTS)|
+                                         (arg_private_network ? CLONE_NEWNET : 0), eventfds);
                 if (pid < 0) {
                         if (errno == EINVAL)
                                 log_error("clone() failed, do you have namespace support enabled in your kernel? (You need UTS, IPC, PID and NET namespacing built in): %m");
                         else
                                 log_error("clone() failed: %m");
 
+                        r = pid;
                         goto finish;
                 }
 
@@ -2853,15 +3189,28 @@ int main(int argc, char *argv[]) {
 
                         /* Turn directory into bind mount */
                         if (mount(arg_directory, arg_directory, "bind", MS_BIND|MS_REC, NULL) < 0) {
-                                log_error("Failed to make bind mount.");
+                                log_error("Failed to make bind mount: %m");
                                 goto child_fail;
                         }
 
-                        if (arg_read_only)
-                                if (mount(arg_directory, arg_directory, "bind", MS_BIND|MS_REMOUNT|MS_RDONLY|MS_REC, NULL) < 0) {
-                                        log_error("Failed to make read-only.");
+                        r = setup_volatile(arg_directory);
+                        if (r < 0)
+                                goto child_fail;
+
+                        if (setup_volatile_state(arg_directory) < 0)
+                                goto child_fail;
+
+                        r = base_filesystem_create(arg_directory);
+                        if (r < 0)
+                                goto child_fail;
+
+                        if (arg_read_only) {
+                                k = bind_remount_recursive(arg_directory, true);
+                                if (k < 0) {
+                                        log_error("Failed to make tree read-only: %s", strerror(-k));
                                         goto child_fail;
                                 }
+                        }
 
                         if (mount_all(arg_directory) < 0)
                                 goto child_fail;
@@ -2874,7 +3223,7 @@ int main(int argc, char *argv[]) {
 
                         dev_setup(arg_directory);
 
-                        if (audit_still_doesnt_work_in_containers() < 0)
+                        if (setup_seccomp() < 0)
                                 goto child_fail;
 
                         if (setup_dev_console(arg_directory, console) < 0)
@@ -2897,10 +3246,13 @@ int main(int argc, char *argv[]) {
                         if (setup_journal(arg_directory) < 0)
                                 goto child_fail;
 
-                        if (mount_binds(arg_directory, arg_bind, 0) < 0)
+                        if (mount_binds(arg_directory, arg_bind, false) < 0)
                                 goto child_fail;
 
-                        if (mount_binds(arg_directory, arg_bind_ro, MS_RDONLY) < 0)
+                        if (mount_binds(arg_directory, arg_bind_ro, true) < 0)
+                                goto child_fail;
+
+                        if (mount_tmpfs(arg_directory) < 0)
                                 goto child_fail;
 
                         if (setup_kdbus(arg_directory, kdbus_domain) < 0)
@@ -2909,8 +3261,11 @@ int main(int argc, char *argv[]) {
                         /* Tell the parent that we are ready, and that
                          * it can cgroupify us to that we lack access
                          * to certain devices and resources. */
-                        eventfd_write(child_ready_fd, 1);
-                        child_ready_fd = safe_close(child_ready_fd);
+                        r = eventfd_send_state(eventfds[1],
+                                               EVENTFD_CHILD_SUCCEEDED);
+                        eventfds[1] = safe_close(eventfds[1]);
+                        if (r < 0)
+                                goto child_fail;
 
                         if (chdir(arg_directory) < 0) {
                                 log_error("chdir(%s) failed: %m", arg_directory);
@@ -2954,7 +3309,9 @@ int main(int argc, char *argv[]) {
                         }
 
                         if (!sd_id128_equal(arg_uuid, SD_ID128_NULL)) {
-                                if (asprintf((char**)(envp + n_env++), "container_uuid=" SD_ID128_FORMAT_STR, SD_ID128_FORMAT_VAL(arg_uuid)) < 0) {
+                                char as_uuid[37];
+
+                                if (asprintf((char**)(envp + n_env++), "container_uuid=%s", id128_format_as_uuid(arg_uuid, as_uuid)) < 0) {
                                         log_oom();
                                         goto child_fail;
                                 }
@@ -3010,8 +3367,10 @@ int main(int argc, char *argv[]) {
                                 env_use = (char**) envp;
 
                         /* Wait until the parent is ready with the setup, too... */
-                        eventfd_read(parent_ready_fd, &x);
-                        parent_ready_fd = safe_close(parent_ready_fd);
+                        r = eventfd_parent_succeeded(eventfds[0]);
+                        eventfds[0] = safe_close(eventfds[0]);
+                        if (r < 0)
+                                goto child_fail;
 
                         if (arg_boot) {
                                 char **a;
@@ -3042,98 +3401,112 @@ int main(int argc, char *argv[]) {
                         log_error("execv() failed: %m");
 
                 child_fail:
+                        /* Tell the parent that the setup failed, so he
+                         * can clean up resources and terminate. */
+                        if (eventfds[1] != -1)
+                                eventfd_send_state(eventfds[1],
+                                                   EVENTFD_CHILD_FAILED);
                         _exit(EXIT_FAILURE);
                 }
 
                 fdset_free(fds);
                 fds = NULL;
 
-                /* Wait until the child reported that it is ready with
-                 * all it needs to do with priviliges. After we got
-                 * the notification we can make the process join its
-                 * cgroup which might limit what it can do */
-                eventfd_read(child_ready_fd, &x);
+                /* Wait for the child event:
+                 * If EVENTFD_CHILD_FAILED, the child will terminate soon.
+                 * If EVENTFD_CHILD_SUCCEEDED, the child is reporting that
+                 * it is ready with all it needs to do with priviliges.
+                 * After we got the notification we can make the process
+                 * join its cgroup which might limit what it can do */
+                r = eventfd_child_succeeded(eventfds[1]);
+                eventfds[1] = safe_close(eventfds[1]);
 
-                r = register_machine(pid);
-                if (r < 0)
-                        goto finish;
+                if (r >= 0) {
+                        int ifi = 0;
 
-                r = move_network_interfaces(pid);
-                if (r < 0)
-                        goto finish;
+                        r = move_network_interfaces(pid);
+                        if (r < 0)
+                                goto finish;
 
-                r = setup_veth(pid, veth_name);
-                if (r < 0)
-                        goto finish;
+                        r = setup_veth(pid, veth_name, &ifi);
+                        if (r < 0)
+                                goto finish;
 
-                r = setup_bridge(veth_name);
-                if (r < 0)
-                        goto finish;
+                        r = setup_bridge(veth_name, &ifi);
+                        if (r < 0)
+                                goto finish;
 
-                r = setup_macvlan(pid);
-                if (r < 0)
-                        goto finish;
+                        r = setup_macvlan(pid);
+                        if (r < 0)
+                                goto finish;
 
-                /* Notify the child that the parent is ready with all
-                 * its setup, and thtat the child can now hand over
-                 * control to the code to run inside the container. */
-                eventfd_write(parent_ready_fd, 1);
+                        r = register_machine(pid, ifi);
+                        if (r < 0)
+                                goto finish;
 
-                k = process_pty(master, &mask, arg_boot ? pid : 0, SIGRTMIN+3);
-                if (k < 0) {
-                        r = EXIT_FAILURE;
-                        break;
-                }
+                        /* Block SIGCHLD here, before notifying child.
+                         * process_pty() will handle it with the other signals. */
+                        r = sigprocmask(SIG_BLOCK, &mask_chld, NULL);
+                        if (r < 0)
+                                goto finish;
 
-                if (!arg_quiet)
-                        putc('\n', stdout);
+                        /* Reset signal to default */
+                        r = default_signals(SIGCHLD, -1);
+                        if (r < 0)
+                                goto finish;
 
-                /* Kill if it is not dead yet anyway */
-                terminate_machine(pid);
+                        /* Notify the child that the parent is ready with all
+                         * its setup, and that the child can now hand over
+                         * control to the code to run inside the container. */
+                        r = eventfd_send_state(eventfds[0], EVENTFD_PARENT_SUCCEEDED);
+                        eventfds[0] = safe_close(eventfds[0]);
+                        if (r < 0)
+                                goto finish;
 
-                /* Redundant, but better safe than sorry */
-                kill(pid, SIGKILL);
-
-                k = wait_for_terminate(pid, &status);
-                pid = 0;
-
-                if (k < 0) {
-                        r = EXIT_FAILURE;
-                        break;
-                }
-
-                if (status.si_code == CLD_EXITED) {
-                        r = status.si_status;
-                        if (status.si_status != 0) {
-                                log_error("Container %s failed with error code %i.", arg_machine, status.si_status);
+                        k = process_pty(master, &mask, arg_boot ? pid : 0, SIGRTMIN+3);
+                        if (k < 0) {
+                                r = EXIT_FAILURE;
                                 break;
                         }
 
                         if (!arg_quiet)
-                                log_debug("Container %s exited successfully.", arg_machine);
-                        break;
-                } else if (status.si_code == CLD_KILLED &&
-                           status.si_status == SIGINT) {
+                                putc('\n', stdout);
 
-                        if (!arg_quiet)
-                                log_info("Container %s has been shut down.", arg_machine);
-                        r = 0;
-                        break;
-                } else if (status.si_code == CLD_KILLED &&
-                           status.si_status == SIGHUP) {
+                        /* Kill if it is not dead yet anyway */
+                        terminate_machine(pid);
+                }
 
-                        if (!arg_quiet)
-                                log_info("Container %s is being rebooted.", arg_machine);
-                        continue;
-                } else if (status.si_code == CLD_KILLED ||
-                           status.si_code == CLD_DUMPED) {
+                /* Normally redundant, but better safe than sorry */
+                kill(pid, SIGKILL);
 
-                        log_error("Container %s terminated by signal %s.", arg_machine, signal_to_string(status.si_status));
+                r = wait_for_container(pid, &container_status);
+                pid = 0;
+
+                if (r < 0) {
+                        /* We failed to wait for the container, or the
+                         * container exited abnormally */
                         r = EXIT_FAILURE;
                         break;
-                } else {
-                        log_error("Container %s failed due to unknown reason.", arg_machine);
-                        r = EXIT_FAILURE;
+                } else if (r > 0 || container_status == CONTAINER_TERMINATED)
+                        /* The container exited with a non-zero
+                         * status, or with zero status and no reboot
+                         * was requested. */
+                        break;
+
+                /* CONTAINER_REBOOTED, loop again */
+
+                if (arg_keep_unit) {
+                        /* Special handling if we are running as a
+                         * service: instead of simply restarting the
+                         * machine we want to restart the entire
+                         * service, so let's inform systemd about this
+                         * with the special exit code 133. The service
+                         * file uses RestartForceExitStatus=133 so
+                         * that this results in a full nspawn
+                         * restart. This is necessary since we might
+                         * have cgroup parameters set we want to have
+                         * flushed out. */
+                        r = 133;
                         break;
                 }
         }
@@ -3152,6 +3525,7 @@ finish:
         strv_free(arg_network_macvlan);
         strv_free(arg_bind);
         strv_free(arg_bind_ro);
+        strv_free(arg_tmpfs);
 
         return r;
 }

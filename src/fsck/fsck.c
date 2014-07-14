@@ -4,6 +4,7 @@
   This file is part of systemd.
 
   Copyright 2010 Lennart Poettering
+  Copyright 2014 Holger Hans Peter Freyther
 
   systemd is free software; you can redistribute it and/or modify it
   under the terms of the GNU Lesser General Public License as published by
@@ -42,6 +43,7 @@
 static bool arg_skip = false;
 static bool arg_force = false;
 static bool arg_show_progress = false;
+static const char *arg_repair = "-a";
 
 static void start_target(const char *target) {
         _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
@@ -84,13 +86,25 @@ static int parse_proc_cmdline_item(const char *key, const char *value) {
                 else if (streq(value, "skip"))
                         arg_skip = true;
                 else
-                        log_warning("Invalid fsck.mode= parameter. Ignoring.");
-        } else if (startswith(key, "fsck."))
-                log_warning("Invalid fsck parameter. Ignoring.");
+                        log_warning("Invalid fsck.mode= parameter '%s'. Ignoring.", value);
+
+        } else if (streq(key, "fsck.repair") && value) {
+
+                if (streq(value, "preen"))
+                        arg_repair = "-a";
+                else if (streq(value, "yes"))
+                        arg_repair = "-y";
+                else if (streq(value, "no"))
+                        arg_repair = "-n";
+                else
+                        log_warning("Invalid fsck.repair= parameter '%s'. Ignoring.", value);
+        }
+
 #ifdef HAVE_SYSV_COMPAT
         else if (streq(key, "fastboot") && !value) {
                 log_warning("Please pass 'fsck.mode=skip' rather than 'fastboot' on the kernel command line.");
                 arg_skip = true;
+
         } else if (streq(key, "forcefsck") && !value) {
                 log_warning("Please pass 'fsck.mode=force' rather than 'forcefsck' on the kernel command line.");
                 arg_force = true;
@@ -101,6 +115,7 @@ static int parse_proc_cmdline_item(const char *key, const char *value) {
 }
 
 static void test_files(void) {
+
 #ifdef HAVE_SYSV_COMPAT
         if (access("/fastboot", F_OK) >= 0) {
                 log_error("Please pass 'fsck.mode=skip' on the kernel command line rather than creating /fastboot on the root file system.");
@@ -287,13 +302,11 @@ int main(int argc, char *argv[]) {
         type = udev_device_get_property_value(udev_device, "ID_FS_TYPE");
         if (type) {
                 r = fsck_exists(type);
-                if (r < 0) {
-                        if (r == -ENOENT) {
-                                log_info("fsck.%s doesn't exist, not checking file system.", type);
-                                return EXIT_SUCCESS;
-                        } else
-                                log_warning("fsck.%s cannot be used: %s", type, strerror(-r));
-                }
+                if (r == -ENOENT) {
+                        log_info("fsck.%s doesn't exist, not checking file system on %s", type, device);
+                        return EXIT_SUCCESS;
+                } else if (r < 0)
+                        log_warning("fsck.%s cannot be used for %s: %s", type, device, strerror(-r));
         }
 
         if (arg_show_progress)
@@ -303,9 +316,20 @@ int main(int argc, char *argv[]) {
                 }
 
         cmdline[i++] = "/sbin/fsck";
-        cmdline[i++] = "-a";
+        cmdline[i++] =  arg_repair;
         cmdline[i++] = "-T";
-        cmdline[i++] = "-l";
+
+        /*
+         * Disable locking which conflict with udev's event
+         * ownershipi, until util-linux moves the flock
+         * synchronization file which prevents multiple fsck running
+         * on the same rotationg media, from the disk device
+         * node to a privately owned regular file.
+         *
+         * https://bugs.freedesktop.org/show_bug.cgi?id=79576#c5
+         *
+         * cmdline[i++] = "-l";
+         */
 
         if (!root_directory)
                 cmdline[i++] = "-M";

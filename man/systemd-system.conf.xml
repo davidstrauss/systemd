@@ -187,7 +187,7 @@
                                 capabilities to include in the
                                 capability bounding set for PID 1 and
                                 its children. See
-                                <citerefentry><refentrytitle>capabilities</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+                                <citerefentry project='man-pages'><refentrytitle>capabilities</refentrytitle><manvolnum>7</manvolnum></citerefentry>
                                 for details. Takes a whitespace-separated
                                 list of capability names as read by
                                 <citerefentry><refentrytitle>cap_from_name</refentrytitle><manvolnum>3</manvolnum></citerefentry>.
@@ -302,18 +302,6 @@
                         </varlistentry>
 
                         <varlistentry>
-                                <term><varname>DefaultCPUQuotaPeriodSec=</varname></term>
-
-                                <listitem><para>Sets the default CPU
-                                quota period. Defaults to 100ms. This
-                                controls th global default for the
-                                <varname>CPUQuotaPeriodSec=</varname>
-                                setting of units, see
-                                <citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry>
-                                for details.</para></listitem>
-                        </varlistentry>
-
-                        <varlistentry>
                                 <term><varname>DefaultTimeoutStartSec=</varname></term>
                                 <term><varname>DefaultTimeoutStopSec=</varname></term>
                                 <term><varname>DefaultRestartSec=</varname></term>
@@ -359,7 +347,7 @@
                                 executed processes. Takes a
                                 space-separated list of variable
                                 assignments. See
-                                <citerefentry><refentrytitle>environ</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+                                <citerefentry project='man-pages'><refentrytitle>environ</refentrytitle><manvolnum>7</manvolnum></citerefentry>
                                 for details about environment
                                 variables.</para>
 
@@ -433,8 +421,8 @@
                           <citerefentry><refentrytitle>systemd.directives</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
                           <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
                           <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-                          <citerefentry><refentrytitle>environ</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
-                          <citerefentry><refentrytitle>capabilities</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+                          <citerefentry project='man-pages'><refentrytitle>environ</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
+                          <citerefentry project='man-pages'><refentrytitle>capabilities</refentrytitle><manvolnum>7</manvolnum></citerefentry>
                   </para>
         </refsect1>
 

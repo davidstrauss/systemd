@@ -53,6 +53,7 @@ typedef enum ServiceRestart {
         SERVICE_RESTART_NO,
         SERVICE_RESTART_ON_SUCCESS,
         SERVICE_RESTART_ON_FAILURE,
+        SERVICE_RESTART_ON_ABNORMAL,
         SERVICE_RESTART_ON_WATCHDOG,
         SERVICE_RESTART_ON_ABORT,
         SERVICE_RESTART_ALWAYS,
@@ -117,7 +118,8 @@ struct Service {
 
         ServiceType type;
         ServiceRestart restart;
-        ExitStatusSet restart_ignore_status;
+        ExitStatusSet restart_prevent_status;
+        ExitStatusSet restart_force_status;
         ExitStatusSet success_status;
 
         /* If set we'll read the main daemon PID from this file */
@@ -174,18 +176,13 @@ struct Service {
         bool forbid_restart:1;
         bool start_timeout_defined:1;
 #ifdef HAVE_SYSV_COMPAT
-        bool is_sysv:1;
-        bool sysv_has_lsb:1;
-        bool sysv_enabled:1;
-        int sysv_start_priority_from_rcnd;
         int sysv_start_priority;
-
-        char *sysv_runlevels;
 #endif
 
         char *bus_name;
 
         char *status_text;
+        int status_errno;
 
         FailureAction failure_action;
 

@@ -74,7 +74,9 @@ typedef enum ExitStatus {
         EXIT_PERSONALITY,  /* 230 */
         EXIT_APPARMOR_PROFILE,
         EXIT_ADDRESS_FAMILIES,
-        EXIT_RUNTIME_DIRECTORY
+        EXIT_RUNTIME_DIRECTORY,
+        EXIT_MAKE_STARTER,
+        EXIT_CHOWN,
 } ExitStatus;
 
 typedef enum ExitStatusLevel {
@@ -85,7 +87,7 @@ typedef enum ExitStatusLevel {
 } ExitStatusLevel;
 
 typedef struct ExitStatusSet {
-        Set *code;
+        Set *status;
         Set *signal;
 } ExitStatusSet;
 
@@ -93,3 +95,6 @@ const char* exit_status_to_string(ExitStatus status, ExitStatusLevel level) _con
 
 bool is_clean_exit(int code, int status, ExitStatusSet *success_status);
 bool is_clean_exit_lsb(int code, int status, ExitStatusSet *success_status);
+
+void exit_status_set_free(ExitStatusSet *x);
+bool exit_status_set_is_empty(ExitStatusSet *x);

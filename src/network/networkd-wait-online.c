@@ -116,6 +116,7 @@ static bool all_configured(Manager *m) {
         if (n <= 0)
                 return false;
 
+        /* wait for networkd to be aware of all the links given on the commandline */
         STRV_FOREACH(ifname, arg_interfaces) {
                 _cleanup_rtnl_message_unref_ sd_rtnl_message *message = NULL, *reply = NULL;
                 bool found = false;
@@ -123,7 +124,7 @@ static bool all_configured(Manager *m) {
 
                 r = sd_rtnl_message_new_link(m->rtnl, &message, RTM_GETLINK, 0);
                 if (r < 0) {
-                        log_warning("colud not create GETLINK message: %s", strerror(-r));
+                        log_warning("could not create GETLINK message: %s", strerror(-r));
                         return false;
                 }
 
@@ -167,48 +168,27 @@ static bool all_configured(Manager *m) {
                 }
         }
 
+        /* wait for all links networkd manages to be in admin state 'configured'
+           and at least one link to gain a carrier */
         for (i = 0; i < n; i++) {
-                _cleanup_free_ char *state = NULL;
-                _cleanup_rtnl_message_unref_ sd_rtnl_message *message = NULL, *reply = NULL;
-                unsigned flags;
-                uint8_t operstate;
+                _cleanup_free_ char *state = NULL, *oper_state = NULL;
+
+                if (sd_network_link_is_loopback(indices[i]))
+                        /* ignore loopback devices */
+                        continue;
 
                 r = sd_network_get_link_state(indices[i], &state);
-                if (r != -EUNATCH && (r < 0 || !streq(state, "configured"))) {
-                        /* managed by networkd, but not yet configured */
+                if (r == -EBUSY || (r >= 0 && !streq(state, "configured")))
+                        /* not yet processed by udev, or managed by networkd, but not yet configured */
                         return false;
-                }
 
-                r = sd_rtnl_message_new_link(m->rtnl, &message, RTM_GETLINK, indices[i]);
-                if (r < 0) {
-                        log_warning("could not create GETLINK message: %s", strerror(-r));
-                        return false;
-                }
-
-                r = sd_rtnl_call(m->rtnl, message, 0, &reply);
-                if (r < 0) {
-                        log_debug("could not get link %u: %s", indices[i], strerror(-r));
-                        continue;
-                }
-
-                r = sd_rtnl_message_link_get_flags(reply, &flags);
-                if (r < 0) {
-                        log_warning("could not get link flags: %s", strerror(-r));
-                        return false;
-                }
-
-                r = sd_rtnl_message_read_u8(reply, IFLA_OPERSTATE, &operstate);
-                if (r < 0) {
-                        log_debug("could not get link operational state: %s", strerror(-r));
-                        operstate = IF_OPER_UNKNOWN;
-                }
-
-                if (!(flags & IFF_LOOPBACK) &&
-                    link_has_carrier(flags, operstate)) {
+                r = sd_network_get_link_operational_state(indices[i], &oper_state);
+                if (r >= 0 &&
+                    (streq(oper_state, "degraded") ||
+                     streq(oper_state, "routable")))
                         /* we wait for at least one link to be ready,
                            regardless of who manages it */
                         one_ready = true;
-                }
         }
 
         return one_ready;
@@ -224,17 +204,7 @@ static int monitor_event_handler(sd_event_source *s, int fd, uint32_t revents,
         if (all_configured(m))
                 sd_event_exit(m->event, 0);
 
-        return 1;
-}
-
-static int newlink_event_handler(sd_rtnl *rtnl, sd_rtnl_message *message, void *userdata) {
-        Manager *m = userdata;
-
-        assert(m);
-        assert(m->event);
-
-        if (all_configured(m))
-                sd_event_exit(m->event, 0);
+        sd_network_monitor_flush(m->monitor);
 
         return 1;
 }
@@ -252,7 +222,6 @@ void manager_free(Manager *m) {
 int main(int argc, char *argv[]) {
         _cleanup_manager_free_ Manager *m = NULL;
         _cleanup_event_source_unref_ sd_event_source *event_source = NULL;
-        _cleanup_network_monitor_unref_ sd_network_monitor *monitor = NULL;
         int r, fd, events;
 
         umask(0022);
@@ -271,25 +240,31 @@ int main(int argc, char *argv[]) {
         if (!m)
                 return log_oom();
 
-        r = sd_network_monitor_new(NULL, &monitor);
-        if (r < 0) {
-                log_error("Could not create monitor: %s", strerror(-r));
-                goto out;
-        }
-
         r = sd_event_new(&m->event);
         if (r < 0) {
                 log_error("Could not create event: %s", strerror(-r));
                 goto out;
         }
 
-        fd = sd_network_monitor_get_fd(monitor);
+        r = sd_rtnl_open(&m->rtnl, 0);
+        if (r < 0) {
+                log_error("Could not create rtnl: %s", strerror(-r));
+                goto out;
+        }
+
+        r = sd_network_monitor_new(NULL, &m->monitor);
+        if (r < 0) {
+                log_error("Could not create monitor: %s", strerror(-r));
+                goto out;
+        }
+
+        fd = sd_network_monitor_get_fd(m->monitor);
         if (fd < 0) {
                 log_error("Could not get monitor fd: %s", strerror(-r));
                 goto out;
         }
 
-        events = sd_network_monitor_get_events(monitor);
+        events = sd_network_monitor_get_events(m->monitor);
         if (events < 0) {
                 log_error("Could not get monitor events: %s", strerror(-r));
                 goto out;
@@ -301,22 +276,6 @@ int main(int argc, char *argv[]) {
                 log_error("Could not add io event source: %s", strerror(-r));
                 goto out;
         }
-
-        r = sd_rtnl_open(&m->rtnl, RTMGRP_LINK);
-        if (r < 0) {
-                log_error("Could not create rtnl: %s", strerror(-r));
-                goto out;
-        }
-
-        r = sd_rtnl_attach_event(m->rtnl, m->event, 0);
-        if (r < 0) {
-                log_error("Could not attach event to rtnl: %s", strerror(-r));
-                return r;
-        }
-
-        r = sd_rtnl_add_match(m->rtnl, RTM_NEWLINK, newlink_event_handler, m);
-        if (r < 0)
-                return r;
 
         if (all_configured(m)) {
                 r = 0;

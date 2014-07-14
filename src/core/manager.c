@@ -429,7 +429,6 @@ int manager_new(SystemdRunningAs running_as, Manager **_m) {
         m->running_as = running_as;
         m->exit_code = _MANAGER_EXIT_CODE_INVALID;
         m->default_timer_accuracy_usec = USEC_PER_MINUTE;
-        m->default_cpu_quota_period_usec = 100 * USEC_PER_MSEC;
 
         m->idle_pipe[0] = m->idle_pipe[1] = m->idle_pipe[2] = m->idle_pipe[3] = -1;
 
@@ -453,6 +452,10 @@ int manager_new(SystemdRunningAs running_as, Manager **_m) {
                 goto fail;
 
         r = hashmap_ensure_allocated(&m->watch_bus, string_hash_func, string_compare_func);
+        if (r < 0)
+                goto fail;
+
+        r = set_ensure_allocated(&m->startup_units, trivial_hash_func, trivial_compare_func);
         if (r < 0)
                 goto fail;
 
@@ -799,6 +802,7 @@ void manager_free(Manager *m) {
         hashmap_free(m->watch_bus);
         enabled_context_free(m->enabled);
 
+        set_free(m->startup_units);
         set_free(m->failed_units);
 
         sd_event_source_unref(m->signal_event_source);
@@ -973,6 +977,7 @@ int manager_startup(Manager *m, FILE *serialization, FDSet *fds) {
 
         r = lookup_paths_init(
                         &m->lookup_paths, m->running_as, true,
+                        NULL,
                         m->generator_unit_path,
                         m->generator_unit_path_early,
                         m->generator_unit_path_late);
@@ -2135,9 +2140,6 @@ int manager_serialize(Manager *m, FILE *f, FDSet *fds, bool switching_root) {
                 if (u->id != t)
                         continue;
 
-                if (!unit_can_serialize(u))
-                        continue;
-
                 /* Start marker */
                 fputs(u->id, f);
                 fputc('\n', f);
@@ -2379,6 +2381,7 @@ int manager_reload(Manager *m) {
 
         q = lookup_paths_init(
                         &m->lookup_paths, m->running_as, true,
+                        NULL,
                         m->generator_unit_path,
                         m->generator_unit_path_early,
                         m->generator_unit_path_late);
@@ -2451,6 +2454,8 @@ bool manager_unit_inactive_or_pending(Manager *m, const char *name) {
 void manager_check_finished(Manager *m) {
         char userspace[FORMAT_TIMESPAN_MAX], initrd[FORMAT_TIMESPAN_MAX], kernel[FORMAT_TIMESPAN_MAX], sum[FORMAT_TIMESPAN_MAX];
         usec_t firmware_usec, loader_usec, kernel_usec, initrd_usec, userspace_usec, total_usec;
+        Unit *u = NULL;
+        Iterator i;
 
         assert(m);
 
@@ -2475,6 +2480,9 @@ void manager_check_finished(Manager *m) {
 
         /* Turn off confirm spawn now */
         m->confirm_spawn = false;
+
+        /* This is no longer the first boot */
+        manager_set_first_boot(m, false);
 
         if (dual_timestamp_is_set(&m->finish_timestamp))
                 return;
@@ -2537,6 +2545,9 @@ void manager_check_finished(Manager *m) {
                                    format_timespan(sum, sizeof(sum), total_usec, USEC_PER_MSEC),
                                    NULL);
         }
+
+        SET_FOREACH(u, m->startup_units, i)
+                cgroup_context_apply(unit_get_cgroup_context(u), unit_get_cgroup_mask(u), u->cgroup_path, manager_state(m));
 
         bus_manager_send_finished(m, firmware_usec, loader_usec, kernel_usec, initrd_usec, userspace_usec, total_usec);
 
@@ -2801,6 +2812,20 @@ static bool manager_get_show_status(Manager *m) {
          * that there's something nice to see when people press Esc */
 
         return plymouth_running();
+}
+
+void manager_set_first_boot(Manager *m, bool b) {
+        assert(m);
+
+        if (m->running_as != SYSTEMD_SYSTEM)
+                return;
+
+        m->first_boot = b;
+
+        if (m->first_boot)
+                touch("/run/systemd/first-boot");
+        else
+                unlink("/run/systemd/first-boot");
 }
 
 void manager_status_printf(Manager *m, bool ephemeral, const char *status, const char *format, ...) {

@@ -76,6 +76,10 @@
                 <literal>[Link]</literal> section specifying how the device should be
                 configured. The first (in lexical order) of the link files that matches
                 a given device is applied.</para>
+        </refsect1>
+
+        <refsect1>
+                <title>[Match] Section Options</title>
 
                 <para>A link file is said to match a device if each of the entries in the
                 <literal>[Match]</literal> section matches, or if the section is empty.
@@ -101,7 +105,7 @@
                                 <listitem>
                                         <para>The driver currently bound to the device,
                                         as exposed by the udev property <literal>DRIVER</literal>
-                                        of its parent device, or if that is not set the
+                                        of its parent device, or if that is not set, the
                                         driver as exposed by <literal>ethtool -i</literal>
                                         of the device itself.</para>
                                 </listitem>
@@ -156,6 +160,11 @@
                         </varlistentry>
                 </variablelist>
 
+        </refsect1>
+
+        <refsect1>
+                <title>[Link] Section Options</title>
+
                 <para>The <literal>[Link]</literal> section accepts the following
                 keys:</para>
 
@@ -186,7 +195,7 @@
                                                         <listitem>
                                                                 <para>If the hardware has a persistent
                                                                 MAC address, as most hardware should,
-                                                                and this is used by the kernel, nothing
+                                                                and if it is used by the kernel, nothing
                                                                 is done. Otherwise, a new MAC address
                                                                 is generated which is guaranteed to be
                                                                 the same on every boot for the given
@@ -236,8 +245,8 @@
                                                         <listitem>
                                                                 <para>The name is set based on entries in
                                                                 the udev's Hardware Database with the key
-                                                                <literal>ID_NET_NAME_FROM_DATABASE</literal>
-                                                                .</para>
+                                                                <literal>ID_NET_NAME_FROM_DATABASE</literal>.
+                                                                </para>
                                                         </listitem>
                                                 </varlistentry>
                                                 <varlistentry>
@@ -245,8 +254,8 @@
                                                         <listitem>
                                                                 <para>The name is set based on information given by
                                                                 the firmware for on-board devices, as exported by
-                                                                the udev property <literal>ID_NET_NAME_ONBOARD</literal>
-                                                                .</para>
+                                                                the udev property <literal>ID_NET_NAME_ONBOARD</literal>.
+                                                                </para>
                                                         </listitem>
                                                 </varlistentry>
                                                 <varlistentry>
@@ -254,8 +263,8 @@
                                                         <listitem>
                                                                 <para>The name is set based on information given by
                                                                 the firmware for hot-plug devices, as exported by
-                                                                the udev property <literal>ID_NET_NAME_SLOT</literal>
-                                                                .</para>
+                                                                the udev property <literal>ID_NET_NAME_SLOT</literal>.
+                                                                </para>
                                                         </listitem>
                                                 </varlistentry>
                                                 <varlistentry>
@@ -329,7 +338,7 @@
                                                 <varlistentry>
                                                         <term><literal>magic</literal></term>
                                                         <listitem>
-                                                                <para>Wake on receipt of a magic packet
+                                                                <para>Wake on receipt of a magic packet.
                                                                 </para>
                                                         </listitem>
                                                 </varlistentry>

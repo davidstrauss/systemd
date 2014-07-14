@@ -67,6 +67,22 @@
 #  error Unknown gid_t size
 #endif
 
+#if SIZEOF_TIME_T == 8
+#  define PRI_TIME PRIu64
+#elif SIZEOF_GID_T == 4
+#  define PRI_TIME PRIu32
+#else
+#  error Unknown time_t size
+#endif
+
+#if SIZEOF_RLIM_T == 8
+#  define RLIM_FMT "%" PRIu64
+#elif SIZEOF_RLIM_T == 4
+#  define RLIM_FMT "%" PRIu32
+#else
+#  error Unknown rlim_t size
+#endif
+
 #include "macro.h"
 #include "time-util.h"
 
@@ -76,6 +92,12 @@
 #define QUOTES     "\"\'"
 #define COMMENTS   "#;"
 #define GLOB_CHARS "*?["
+
+/* What characters are special in the shell? */
+/* must be escaped outside and inside double-quotes */
+#define SHELL_NEED_ESCAPE "\"\\`$"
+/* can be escaped or double-quoted */
+#define SHELL_NEED_QUOTES SHELL_NEED_ESCAPE GLOB_CHARS "'()<>|&;"
 
 #define FORMAT_BYTES_MAX 8
 
@@ -236,6 +258,7 @@ char *strnappend(const char *s, const char *suffix, size_t length);
 char *replace_env(const char *format, char **env);
 char **replace_env_argv(char **argv, char **env);
 
+int readlinkat_malloc(int fd, const char *p, char **ret);
 int readlink_malloc(const char *p, char **r);
 int readlink_and_make_absolute(const char *p, char **r);
 int readlink_and_canonicalize(const char *p, char **r);
@@ -365,7 +388,8 @@ bool fstype_is_network(const char *fstype);
 int chvt(int vt);
 
 int read_one_char(FILE *f, char *ret, usec_t timeout, bool *need_nl);
-int ask(char *ret, const char *replies, const char *text, ...) _printf_(3, 4);
+int ask_char(char *ret, const char *replies, const char *text, ...) _printf_(3, 4);
+int ask_string(char **ret, const char *text, ...) _printf_(2, 3);
 
 int reset_terminal_fd(int fd, bool switch_to_text);
 int reset_terminal(const char *name);
@@ -393,6 +417,7 @@ char* dirname_malloc(const char *path);
 void rename_process(const char name[8]);
 
 void sigset_add_many(sigset_t *ss, ...);
+int sigprocmask_many(int how, ...);
 
 bool hostname_is_set(void);
 
@@ -461,6 +486,7 @@ char *ellipsize(const char *s, size_t length, unsigned percent);
                                    /* bytes                 columns */
 char *ellipsize_mem(const char *s, size_t old_length, size_t new_length, unsigned percent);
 
+int touch_file(const char *path, bool parents, usec_t stamp, uid_t uid, gid_t gid, mode_t mode);
 int touch(const char *path);
 
 char *unquote(const char *s, const char *quotes);
@@ -496,6 +522,8 @@ bool plymouth_running(void);
 bool hostname_is_valid(const char *s) _pure_;
 char* hostname_cleanup(char *s, bool lowercase);
 
+bool machine_name_is_valid(const char *s) _pure_;
+
 char* strshorten(char *s, size_t l);
 
 int terminal_vhangup_fd(int fd);
@@ -503,9 +531,9 @@ int terminal_vhangup(const char *name);
 
 int vt_disallocate(const char *name);
 
-int copy_file(const char *from, const char *to, int flags);
-
 int symlink_atomic(const char *from, const char *to);
+int mknod_atomic(const char *path, mode_t mode, dev_t dev);
+int mkfifo_atomic(const char *path, mode_t mode);
 
 int fchmod_umask(int fd, mode_t mode);
 
@@ -526,7 +554,6 @@ int glob_extend(char ***strv, const char *path);
 
 int dirent_ensure_type(DIR *d, struct dirent *de);
 
-int in_search_path(const char *path, char **search);
 int get_files_in_directory(const char *path, char ***list);
 
 char *strjoin(const char *x, ...) _sentinel_;
@@ -649,14 +676,21 @@ DEFINE_TRIVIAL_CLEANUP_FUNC(FILE*, endmntent);
 #define _cleanup_close_pair_ _cleanup_(close_pairp)
 
 _malloc_  _alloc_(1, 2) static inline void *malloc_multiply(size_t a, size_t b) {
-        if (_unlikely_(b == 0 || a > ((size_t) -1) / b))
+        if (_unlikely_(b != 0 && a > ((size_t) -1) / b))
                 return NULL;
 
         return malloc(a * b);
 }
 
+_alloc_(2, 3) static inline void *realloc_multiply(void *p, size_t a, size_t b) {
+        if (_unlikely_(b != 0 && a > ((size_t) -1) / b))
+                return NULL;
+
+        return realloc(p, a * b);
+}
+
 _alloc_(2, 3) static inline void *memdup_multiply(const void *p, size_t a, size_t b) {
-        if (_unlikely_(b == 0 || a > ((size_t) -1) / b))
+        if (_unlikely_(b != 0 && a > ((size_t) -1) / b))
                 return NULL;
 
         return memdup(p, a * b);
@@ -665,7 +699,7 @@ _alloc_(2, 3) static inline void *memdup_multiply(const void *p, size_t a, size_
 bool filename_is_safe(const char *p) _pure_;
 bool path_is_safe(const char *p) _pure_;
 bool string_is_safe(const char *p) _pure_;
-bool string_has_cc(const char *p) _pure_;
+bool string_has_cc(const char *p, const char *ok) _pure_;
 
 /**
  * Check if a string contains any glob patterns.
@@ -688,6 +722,7 @@ typedef enum DrawSpecialChar {
         DRAW_TRIANGULAR_BULLET,
         DRAW_BLACK_CIRCLE,
         DRAW_ARROW,
+        DRAW_DASH,
         _DRAW_SPECIAL_CHAR_MAX
 } DrawSpecialChar;
 
@@ -893,8 +928,8 @@ int parse_proc_cmdline(int (*parse_word)(const char *key, const char *value));
 
 int container_get_leader(const char *machine, pid_t *pid);
 
-int namespace_open(pid_t pid, int *pidns_fd, int *mntns_fd, int *root_fd);
-int namespace_enter(int pidns_fd, int mntns_fd, int root_fd);
+int namespace_open(pid_t pid, int *pidns_fd, int *mntns_fd, int *netns_fd, int *root_fd);
+int namespace_enter(int pidns_fd, int mntns_fd, int netns_fd, int root_fd);
 
 bool pid_is_alive(pid_t pid);
 bool pid_is_unwaited(pid_t pid);
@@ -924,3 +959,16 @@ union file_handle_union {
 };
 
 int update_reboot_param_file(const char *param);
+
+int umount_recursive(const char *target, int flags);
+
+int bind_remount_recursive(const char *prefix, bool ro);
+
+int fflush_and_check(FILE *f);
+
+char *tempfn_xxxxxx(const char *p);
+char *tempfn_random(const char *p);
+
+bool is_localhost(const char *hostname);
+
+int take_password_lock(const char *root);

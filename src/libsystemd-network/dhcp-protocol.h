@@ -44,6 +44,7 @@ struct DHCPMessage {
         uint8_t sname[64];
         uint8_t file[128];
         be32_t magic;
+        uint8_t options[0];
 } _packed_;
 
 typedef struct DHCPMessage DHCPMessage;
@@ -59,7 +60,7 @@ typedef struct DHCPPacket DHCPPacket;
 #define DHCP_IP_SIZE            (int32_t)(sizeof(struct iphdr))
 #define DHCP_IP_UDP_SIZE        (int32_t)(sizeof(struct udphdr) + DHCP_IP_SIZE)
 #define DHCP_MESSAGE_SIZE       (int32_t)(sizeof(DHCPMessage))
-#define DHCP_MIN_OPTIONS_SIZE   308
+#define DHCP_MIN_OPTIONS_SIZE   308 /* spec says 312, but that includes the magic cookie */
 #define DHCP_MAGIC_COOKIE       (uint32_t)(0x63825363)
 
 enum {
@@ -104,12 +105,22 @@ enum {
 enum {
         DHCP_OPTION_PAD                         = 0,
         DHCP_OPTION_SUBNET_MASK                 = 1,
+        DHCP_OPTION_TIME_OFFSET                 = 2,
         DHCP_OPTION_ROUTER                      = 3,
         DHCP_OPTION_DOMAIN_NAME_SERVER          = 6,
         DHCP_OPTION_HOST_NAME                   = 12,
+        DHCP_OPTION_BOOT_FILE_SIZE              = 13,
         DHCP_OPTION_DOMAIN_NAME                 = 15,
         DHCP_OPTION_ROOT_PATH                   = 17,
+        DHCP_OPTION_ENABLE_IP_FORWARDING        = 19,
+        DHCP_OPTION_ENABLE_IP_FORWARDING_NL     = 20,
+        DHCP_OPTION_POLICY_FILTER               = 21,
+        DHCP_OPTION_INTERFACE_MDR               = 22,
+        DHCP_OPTION_INTERFACE_TTL               = 23,
+        DHCP_OPTION_INTERFACE_MTU_AGING_TIMEOUT = 24,
         DHCP_OPTION_INTERFACE_MTU               = 26,
+        DHCP_OPTION_BROADCAST                   = 28,
+        DHCP_OPTION_STATIC_ROUTE                = 33,
         DHCP_OPTION_NTP_SERVER                  = 42,
         DHCP_OPTION_REQUESTED_IP_ADDRESS        = 50,
         DHCP_OPTION_IP_ADDRESS_LEASE_TIME       = 51,
@@ -120,6 +131,8 @@ enum {
         DHCP_OPTION_MAXIMUM_MESSAGE_SIZE        = 57,
         DHCP_OPTION_RENEWAL_T1_TIME             = 58,
         DHCP_OPTION_REBINDING_T2_TIME           = 59,
+        DHCP_OPTION_VENDOR_CLASS_IDENTIFIER     = 60,
         DHCP_OPTION_CLIENT_IDENTIFIER           = 61,
+        DHCP_OPTION_CLASSLESS_STATIC_ROUTE      = 121,
         DHCP_OPTION_END                         = 255,
 };

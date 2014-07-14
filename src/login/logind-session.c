@@ -213,7 +213,6 @@ int session_save(Session *s) {
 
         if (s->scope)
                 fprintf(f, "SCOPE=%s\n", s->scope);
-
         if (s->scope_job)
                 fprintf(f, "SCOPE_JOB=%s\n", s->scope_job);
 
@@ -229,17 +228,54 @@ int session_save(Session *s) {
         if (s->display)
                 fprintf(f, "DISPLAY=%s\n", s->display);
 
-        if (s->remote_host)
-                fprintf(f, "REMOTE_HOST=%s\n", s->remote_host);
+        if (s->remote_host) {
+                _cleanup_free_ char *escaped;
 
-        if (s->remote_user)
-                fprintf(f, "REMOTE_USER=%s\n", s->remote_user);
+                escaped = cescape(s->remote_host);
+                if (!escaped) {
+                        r = -ENOMEM;
+                        goto finish;
+                }
 
-        if (s->service)
-                fprintf(f, "SERVICE=%s\n", s->service);
+                fprintf(f, "REMOTE_HOST=%s\n", escaped);
+        }
 
-        if (s->desktop)
-                fprintf(f, "DESKTOP=%s\n", s->desktop);
+        if (s->remote_user) {
+                _cleanup_free_ char *escaped;
+
+                escaped = cescape(s->remote_user);
+                if (!escaped) {
+                        r = -ENOMEM;
+                        goto finish;
+                }
+
+                fprintf(f, "REMOTE_USER=%s\n", escaped);
+        }
+
+        if (s->service) {
+                _cleanup_free_ char *escaped;
+
+                escaped = cescape(s->service);
+                if (!escaped) {
+                        r = -ENOMEM;
+                        goto finish;
+                }
+
+                fprintf(f, "SERVICE=%s\n", escaped);
+        }
+
+        if (s->desktop) {
+                _cleanup_free_ char *escaped;
+
+
+                escaped = cescape(s->desktop);
+                if (!escaped) {
+                        r = -ENOMEM;
+                        goto finish;
+                }
+
+                fprintf(f, "DESKTOP=%s\n", escaped);
+        }
 
         if (s->seat && seat_has_vts(s->seat))
                 fprintf(f, "VTNR=%u\n", s->vtnr);
@@ -533,7 +569,7 @@ int session_start(Session *s) {
                    MESSAGE_ID(SD_MESSAGE_SESSION_START),
                    "SESSION_ID=%s", s->id,
                    "USER_ID=%s", s->user->name,
-                   "LEADER=%lu", (unsigned long) s->leader,
+                   "LEADER="PID_FMT, s->leader,
                    "MESSAGE=New session %s of user %s.", s->id, s->user->name,
                    NULL);
 
@@ -545,6 +581,8 @@ int session_start(Session *s) {
 
         s->started = true;
 
+        user_elect_display(s->user);
+
         /* Save data */
         session_save(s);
         user_save(s->user);
@@ -553,7 +591,7 @@ int session_start(Session *s) {
 
         /* Send signals */
         session_send_signal(s, true);
-        user_send_changed(s->user, "Sessions", NULL);
+        user_send_changed(s->user, "Sessions", "Display", NULL);
         if (s->seat) {
                 if (s->seat->active == s)
                         seat_send_changed(s->seat, "Sessions", "ActiveSession", NULL);
@@ -612,6 +650,8 @@ int session_stop(Session *s, bool force) {
 
         s->stopping = true;
 
+        user_elect_display(s->user);
+
         session_save(s);
         user_save(s->user);
 
@@ -632,7 +672,7 @@ int session_finalize(Session *s) {
                            MESSAGE_ID(SD_MESSAGE_SESSION_STOP),
                            "SESSION_ID=%s", s->id,
                            "USER_ID=%s", s->user->name,
-                           "LEADER=%lu", (unsigned long) s->leader,
+                           "LEADER="PID_FMT, s->leader,
                            "MESSAGE=Removed session %s.", s->id,
                            NULL);
 
@@ -660,7 +700,7 @@ int session_finalize(Session *s) {
         }
 
         user_save(s->user);
-        user_send_changed(s->user, "Sessions", NULL);
+        user_send_changed(s->user, "Sessions", "Display", NULL);
 
         return r;
 }

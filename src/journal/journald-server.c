@@ -67,6 +67,7 @@
 #define DEFAULT_SYNC_INTERVAL_USEC (5*USEC_PER_MINUTE)
 #define DEFAULT_RATE_LIMIT_INTERVAL (30*USEC_PER_SEC)
 #define DEFAULT_RATE_LIMIT_BURST 1000
+#define DEFAULT_MAX_FILE_USEC USEC_PER_MONTH
 
 #define RECHECK_AVAILABLE_SPACE_USEC (30*USEC_PER_SEC)
 
@@ -205,7 +206,7 @@ void server_fix_perms(Server *s, JournalFile *f, uid_t uid) {
                 log_warning("Failed to fix access mode on %s, ignoring: %s", f->path, strerror(-r));
 
 #ifdef HAVE_ACL
-        if (uid <= 0)
+        if (uid <= SYSTEM_UID_MAX)
                 return;
 
         acl = acl_get_fd(f->fd);
@@ -258,7 +259,7 @@ static JournalFile* find_journal(Server *s, uid_t uid) {
         if (s->runtime_journal)
                 return s->runtime_journal;
 
-        if (uid <= 0)
+        if (uid <= SYSTEM_UID_MAX)
                 return s->system_journal;
 
         r = sd_id128_get_machine(&machine);
@@ -269,8 +270,8 @@ static JournalFile* find_journal(Server *s, uid_t uid) {
         if (f)
                 return f;
 
-        if (asprintf(&p, "/var/log/journal/" SD_ID128_FORMAT_STR "/user-%lu.journal",
-                     SD_ID128_FORMAT_VAL(machine), (unsigned long) uid) < 0)
+        if (asprintf(&p, "/var/log/journal/" SD_ID128_FORMAT_STR "/user-"UID_FMT".journal",
+                     SD_ID128_FORMAT_VAL(machine), uid) < 0)
                 return s->system_journal;
 
         while (hashmap_size(s->user_journals) >= USER_JOURNALS_MAX) {
@@ -576,13 +577,13 @@ static void dispatch_message_real(
         if (ucred) {
                 realuid = ucred->uid;
 
-                sprintf(pid, "_PID=%lu", (unsigned long) ucred->pid);
+                sprintf(pid, "_PID="PID_FMT, ucred->pid);
                 IOVEC_SET_STRING(iovec[n++], pid);
 
-                sprintf(uid, "_UID=%lu", (unsigned long) ucred->uid);
+                sprintf(uid, "_UID="UID_FMT, ucred->uid);
                 IOVEC_SET_STRING(iovec[n++], uid);
 
-                sprintf(gid, "_GID=%lu", (unsigned long) ucred->gid);
+                sprintf(gid, "_GID="GID_FMT, ucred->gid);
                 IOVEC_SET_STRING(iovec[n++], gid);
 
                 r = get_process_comm(ucred->pid, &t);
@@ -616,13 +617,13 @@ static void dispatch_message_real(
 #ifdef HAVE_AUDIT
                 r = audit_session_from_pid(ucred->pid, &audit);
                 if (r >= 0) {
-                        sprintf(audit_session, "_AUDIT_SESSION=%lu", (unsigned long) audit);
+                        sprintf(audit_session, "_AUDIT_SESSION=%"PRIu32, audit);
                         IOVEC_SET_STRING(iovec[n++], audit_session);
                 }
 
                 r = audit_loginuid_from_pid(ucred->pid, &loginuid);
                 if (r >= 0) {
-                        sprintf(audit_loginuid, "_AUDIT_LOGINUID=%lu", (unsigned long) loginuid);
+                        sprintf(audit_loginuid, "_AUDIT_LOGINUID="UID_FMT, loginuid);
                         IOVEC_SET_STRING(iovec[n++], audit_loginuid);
                 }
 #endif
@@ -644,7 +645,7 @@ static void dispatch_message_real(
                         if (cg_path_get_owner_uid(c, &owner) >= 0) {
                                 owner_valid = true;
 
-                                sprintf(owner_uid, "_SYSTEMD_OWNER_UID=%lu", (unsigned long) owner);
+                                sprintf(owner_uid, "_SYSTEMD_OWNER_UID="UID_FMT, owner);
                                 IOVEC_SET_STRING(iovec[n++], owner_uid);
                         }
 
@@ -703,13 +704,13 @@ static void dispatch_message_real(
         if (object_pid) {
                 r = get_process_uid(object_pid, &object_uid);
                 if (r >= 0) {
-                        sprintf(o_uid, "OBJECT_UID=%lu", (unsigned long) object_uid);
+                        sprintf(o_uid, "OBJECT_UID="UID_FMT, object_uid);
                         IOVEC_SET_STRING(iovec[n++], o_uid);
                 }
 
                 r = get_process_gid(object_pid, &object_gid);
                 if (r >= 0) {
-                        sprintf(o_gid, "OBJECT_GID=%lu", (unsigned long) object_gid);
+                        sprintf(o_gid, "OBJECT_GID="GID_FMT, object_gid);
                         IOVEC_SET_STRING(iovec[n++], o_gid);
                 }
 
@@ -737,13 +738,13 @@ static void dispatch_message_real(
 #ifdef HAVE_AUDIT
                 r = audit_session_from_pid(object_pid, &audit);
                 if (r >= 0) {
-                        sprintf(o_audit_session, "OBJECT_AUDIT_SESSION=%lu", (unsigned long) audit);
+                        sprintf(o_audit_session, "OBJECT_AUDIT_SESSION=%"PRIu32, audit);
                         IOVEC_SET_STRING(iovec[n++], o_audit_session);
                 }
 
                 r = audit_loginuid_from_pid(object_pid, &loginuid);
                 if (r >= 0) {
-                        sprintf(o_audit_loginuid, "OBJECT_AUDIT_LOGINUID=%lu", (unsigned long) loginuid);
+                        sprintf(o_audit_loginuid, "OBJECT_AUDIT_LOGINUID="UID_FMT, loginuid);
                         IOVEC_SET_STRING(iovec[n++], o_audit_loginuid);
                 }
 #endif
@@ -761,7 +762,7 @@ static void dispatch_message_real(
                         }
 
                         if (cg_path_get_owner_uid(c, &owner) >= 0) {
-                                sprintf(o_owner_uid, "OBJECT_SYSTEMD_OWNER_UID=%lu", (unsigned long) owner);
+                                sprintf(o_owner_uid, "OBJECT_SYSTEMD_OWNER_UID="UID_FMT, owner);
                                 IOVEC_SET_STRING(iovec[n++], o_owner_uid);
                         }
 
@@ -805,12 +806,11 @@ static void dispatch_message_real(
                 /* Split up strictly by any UID */
                 journal_uid = realuid;
         else if (s->split_mode == SPLIT_LOGIN && realuid > 0 && owner_valid && owner > 0)
-                /* Split up by login UIDs, this avoids creation of
-                 * individual journals for system UIDs.  We do this
-                 * only if the realuid is not root, in order not to
-                 * accidentally leak privileged information to the
-                 * user that is logged by a privileged process that is
-                 * part of an unprivileged session.*/
+                /* Split up by login UIDs.  We do this only if the
+                 * realuid is not root, in order not to accidentally
+                 * leak privileged information to the user that is
+                 * logged by a privileged process that is part of an
+                 * unprivileged session.*/
                 journal_uid = owner;
         else
                 journal_uid = 0;
@@ -990,7 +990,10 @@ static int system_journal_open(Server *s) {
                         /* OK, we really need the runtime journal, so create
                          * it if necessary. */
 
-                        (void) mkdir_parents(fn, 0755);
+                        (void) mkdir("/run/log", 0755);
+                        (void) mkdir("/run/log/journal", 0755);
+                        (void) mkdir_parents(fn, 0750);
+
                         r = journal_file_open_reliably(fn, O_RDWR|O_CREAT, 0640, s->compress, false, &s->runtime_metrics, s->mmap, NULL, &s->runtime_journal);
                         free(fn);
 
@@ -1470,8 +1473,9 @@ int server_init(Server *s) {
         s->rate_limit_interval = DEFAULT_RATE_LIMIT_INTERVAL;
         s->rate_limit_burst = DEFAULT_RATE_LIMIT_BURST;
 
-        s->forward_to_syslog = true;
         s->forward_to_wall = true;
+
+        s->max_file_usec = DEFAULT_MAX_FILE_USEC;
 
         s->max_level_store = LOG_DEBUG;
         s->max_level_syslog = LOG_DEBUG;
@@ -1535,7 +1539,8 @@ int server_init(Server *s) {
 
                         s->stdout_fd = fd;
 
-                } else if (sd_is_socket_unix(fd, SOCK_DGRAM, -1, "/dev/log", 0) > 0) {
+                } else if (sd_is_socket_unix(fd, SOCK_DGRAM, -1, "/dev/log", 0) > 0 ||
+                           sd_is_socket_unix(fd, SOCK_DGRAM, -1, "/run/systemd/journal/dev-log", 0) > 0) {
 
                         if (s->syslog_fd >= 0) {
                                 log_error("Too many /dev/log sockets passed.");

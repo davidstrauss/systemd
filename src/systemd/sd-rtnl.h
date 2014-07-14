@@ -40,7 +40,7 @@ typedef struct sd_rtnl_message sd_rtnl_message;
 typedef int (*sd_rtnl_message_handler_t)(sd_rtnl *rtnl, sd_rtnl_message *m, void *userdata);
 
 /* bus */
-int sd_rtnl_open(sd_rtnl **nl, uint32_t groups);
+int sd_rtnl_open(sd_rtnl **nl, unsigned n_groups, ...);
 
 sd_rtnl *sd_rtnl_ref(sd_rtnl *nl);
 sd_rtnl *sd_rtnl_unref(sd_rtnl *nl);
@@ -86,6 +86,7 @@ int sd_rtnl_message_addr_set_prefixlen(sd_rtnl_message *m, unsigned char prefixl
 int sd_rtnl_message_addr_set_scope(sd_rtnl_message *m, unsigned char scope);
 int sd_rtnl_message_addr_set_flags(sd_rtnl_message *m, unsigned char flags);
 int sd_rtnl_message_addr_get_family(sd_rtnl_message *m, unsigned char *family);
+int sd_rtnl_message_addr_get_prefixlen(sd_rtnl_message *m, unsigned char *prefixlen);
 int sd_rtnl_message_addr_get_scope(sd_rtnl_message *m, unsigned char *scope);
 int sd_rtnl_message_addr_get_flags(sd_rtnl_message *m, unsigned char *flags);
 int sd_rtnl_message_addr_get_ifindex(sd_rtnl_message *m, int *ifindex);

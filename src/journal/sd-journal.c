@@ -1273,7 +1273,7 @@ static bool file_type_wanted(int flags, const char *filename) {
         if (flags & SD_JOURNAL_CURRENT_USER) {
                 char prefix[5 + DECIMAL_STR_MAX(uid_t) + 1];
 
-                assert_se(snprintf(prefix, sizeof(prefix), "user-%lu", (unsigned long) getuid())
+                assert_se(snprintf(prefix, sizeof(prefix), "user-"UID_FMT, getuid())
                           < (int) sizeof(prefix));
 
                 if (file_has_type_prefix(prefix, filename))
@@ -1455,8 +1455,7 @@ static int add_directory(sd_journal *j, const char *prefix, const char *dirname)
                 de = readdir(d);
                 if (!de && errno != 0) {
                         r = -errno;
-                        log_debug("Failed to read directory %s: %s",
-                                  m->path, strerror(errno));
+                        log_debug("Failed to read directory %s: %m", m->path);
                         return r;
                 }
                 if (!de)
@@ -1546,8 +1545,7 @@ static int add_root_directory(sd_journal *j, const char *p) {
                 de = readdir(d);
                 if (!de && errno != 0) {
                         r = -errno;
-                        log_debug("Failed to read directory %s: %s",
-                                  m->path, strerror(errno));
+                        log_debug("Failed to read directory %s: %m", m->path);
                         return r;
                 }
                 if (!de)
@@ -1985,6 +1983,7 @@ _public_ int sd_journal_get_data(sd_journal *j, const char *field, const void **
                 uint64_t p, l;
                 le64_t le_hash;
                 size_t t;
+                int compression;
 
                 p = le64toh(o->entry.items[i].object_offset);
                 le_hash = o->entry.items[i].hash;
@@ -1997,19 +1996,22 @@ _public_ int sd_journal_get_data(sd_journal *j, const char *field, const void **
 
                 l = le64toh(o->object.size) - offsetof(Object, data.payload);
 
-                if (o->object.flags & OBJECT_COMPRESSED) {
-
-#ifdef HAVE_XZ
-                        if (uncompress_startswith(o->data.payload, l,
+                compression = o->object.flags & OBJECT_COMPRESSION_MASK;
+                if (compression) {
+#if defined(HAVE_XZ) || defined(HAVE_LZ4)
+                        if (decompress_startswith(compression,
+                                                  o->data.payload, l,
                                                   &f->compress_buffer, &f->compress_buffer_size,
                                                   field, field_length, '=')) {
 
                                 uint64_t rsize;
 
-                                if (!uncompress_blob(o->data.payload, l,
-                                                     &f->compress_buffer, &f->compress_buffer_size, &rsize,
-                                                     j->data_threshold))
-                                        return -EBADMSG;
+                                r = decompress_blob(compression,
+                                                    o->data.payload, l,
+                                                    &f->compress_buffer, &f->compress_buffer_size, &rsize,
+                                                    j->data_threshold);
+                                if (r < 0)
+                                        return r;
 
                                 *data = f->compress_buffer;
                                 *size = (size_t) rsize;
@@ -2019,7 +2021,6 @@ _public_ int sd_journal_get_data(sd_journal *j, const char *field, const void **
 #else
                         return -EPROTONOSUPPORT;
 #endif
-
                 } else if (l >= field_length+1 &&
                            memcmp(o->data.payload, field, field_length) == 0 &&
                            o->data.payload[field_length] == '=') {
@@ -2046,6 +2047,7 @@ _public_ int sd_journal_get_data(sd_journal *j, const char *field, const void **
 static int return_data(sd_journal *j, JournalFile *f, Object *o, const void **data, size_t *size) {
         size_t t;
         uint64_t l;
+        int compression;
 
         l = le64toh(o->object.size) - offsetof(Object, data.payload);
         t = (size_t) l;
@@ -2054,12 +2056,17 @@ static int return_data(sd_journal *j, JournalFile *f, Object *o, const void **da
         if ((uint64_t) t != l)
                 return -E2BIG;
 
-        if (o->object.flags & OBJECT_COMPRESSED) {
-#ifdef HAVE_XZ
+        compression = o->object.flags & OBJECT_COMPRESSION_MASK;
+        if (compression) {
+#if defined(HAVE_XZ) || defined(HAVE_LZ4)
                 uint64_t rsize;
+                int r;
 
-                if (!uncompress_blob(o->data.payload, l, &f->compress_buffer, &f->compress_buffer_size, &rsize, j->data_threshold))
-                        return -EBADMSG;
+                r = decompress_blob(compression,
+                                    o->data.payload, l, &f->compress_buffer,
+                                    &f->compress_buffer_size, &rsize, j->data_threshold);
+                if (r < 0)
+                        return r;
 
                 *data = f->compress_buffer;
                 *size = (size_t) rsize;

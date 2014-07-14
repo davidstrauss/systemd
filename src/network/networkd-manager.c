@@ -19,10 +19,14 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
  ***/
 
-#include <resolv.h>
+#include <sys/socket.h>
+#include <linux/if.h>
 
+#include "conf-parser.h"
 #include "path-util.h"
 #include "networkd.h"
+#include "networkd-netdev.h"
+#include "network-internal.h"
 #include "libudev-private.h"
 #include "udev-util.h"
 #include "rtnl-util.h"
@@ -40,32 +44,27 @@ const char* const network_dirs[] = {
 #endif
         NULL};
 
-static int dispatch_sigterm(sd_event_source *es, const struct signalfd_siginfo *si, void *userdata) {
-        Manager *m = userdata;
-
-        assert(m);
-
-        log_received_signal(LOG_INFO, si);
-
-        sd_event_exit(m->event, 0);
-        return 0;
-}
-
-static int setup_signals(Manager *m) {
-        sigset_t mask;
+static int setup_default_address_pool(Manager *m) {
+        AddressPool *p;
         int r;
 
         assert(m);
 
-        assert_se(sigemptyset(&mask) == 0);
-        sigset_add_many(&mask, SIGINT, SIGTERM, -1);
-        assert_se(sigprocmask(SIG_SETMASK, &mask, NULL) == 0);
+        /* Add in the well-known private address ranges. */
 
-        r = sd_event_add_signal(m->event, &m->sigterm_event_source, SIGTERM, dispatch_sigterm, m);
+        r = address_pool_new_from_string(m, &p, AF_INET6, "fc00::", 7);
         if (r < 0)
                 return r;
 
-        r = sd_event_add_signal(m->event, &m->sigint_event_source, SIGINT, dispatch_sigterm, m);
+        r = address_pool_new_from_string(m, &p, AF_INET, "192.168.0.0", 16);
+        if (r < 0)
+                return r;
+
+        r = address_pool_new_from_string(m, &p, AF_INET, "172.16.0.0", 12);
+        if (r < 0)
+                return r;
+
+        r = address_pool_new_from_string(m, &p, AF_INET, "10.0.0.0", 8);
         if (r < 0)
                 return r;
 
@@ -80,22 +79,26 @@ int manager_new(Manager **ret) {
         if (!m)
                 return -ENOMEM;
 
+        m->state_file = strdup("/run/systemd/netif/state");
+        if (!m->state_file)
+                return -ENOMEM;
+
         r = sd_event_default(&m->event);
         if (r < 0)
                 return r;
 
         sd_event_set_watchdog(m->event, true);
 
-        r = sd_rtnl_open(&m->rtnl, RTMGRP_LINK | RTMGRP_IPV4_IFADDR);
+        sd_event_add_signal(m->event, NULL, SIGTERM, NULL, NULL);
+        sd_event_add_signal(m->event, NULL, SIGINT, NULL, NULL);
+
+        r = sd_rtnl_open(&m->rtnl, 3, RTNLGRP_LINK, RTNLGRP_IPV4_IFADDR,
+                         RTNLGRP_IPV6_IFADDR);
         if (r < 0)
                 return r;
 
         r = sd_bus_default_system(&m->bus);
         if (r < 0 && r != -ENOENT) /* TODO: drop when we can rely on kdbus */
-                return r;
-
-        r = setup_signals(m);
-        if (r < 0)
                 return r;
 
         /* udev does not initialize devices inside containers,
@@ -121,6 +124,10 @@ int manager_new(Manager **ret) {
 
         LIST_HEAD_INIT(m->networks);
 
+        r = setup_default_address_pool(m);
+        if (r < 0)
+                return r;
+
         *ret = m;
         m = NULL;
 
@@ -131,9 +138,12 @@ void manager_free(Manager *m) {
         Network *network;
         NetDev *netdev;
         Link *link;
+        AddressPool *pool;
 
         if (!m)
                 return;
+
+        free(m->state_file);
 
         udev_monitor_unref(m->udev_monitor);
         udev_unref(m->udev);
@@ -144,15 +154,18 @@ void manager_free(Manager *m) {
         sd_event_unref(m->event);
 
         while ((link = hashmap_first(m->links)))
-                link_free(link);
+                link_unref(link);
         hashmap_free(m->links);
 
         while ((network = m->networks))
                 network_free(network);
 
         while ((netdev = hashmap_first(m->netdevs)))
-                netdev_free(netdev);
+                netdev_unref(netdev);
         hashmap_free(m->netdevs);
+
+        while ((pool = m->address_pools))
+                address_pool_free(pool);
 
         sd_rtnl_unref(m->rtnl);
 
@@ -212,6 +225,8 @@ static int manager_udev_process_link(Manager *m, struct udev_device *device) {
 static int manager_rtnl_process_link(sd_rtnl *rtnl, sd_rtnl_message *message, void *userdata) {
         Manager *m = userdata;
         Link *link = NULL;
+        NetDev *netdev = NULL;
+        uint16_t type;
         char *name;
         int r, ifindex;
 
@@ -219,41 +234,62 @@ static int manager_rtnl_process_link(sd_rtnl *rtnl, sd_rtnl_message *message, vo
         assert(message);
         assert(m);
 
+        r = sd_rtnl_message_get_type(message, &type);
+        if (r < 0) {
+                log_warning("rtnl: could not get message type");
+                return 0;
+        }
+
         r = sd_rtnl_message_link_get_ifindex(message, &ifindex);
         if (r < 0 || ifindex <= 0) {
                 log_warning("rtnl: received link message without valid ifindex");
                 return 0;
-        }
-
-        link_get(m, ifindex, &link);
-        if (!link) {
-                /* link is new, so add it */
-                r = link_add(m, message, &link);
-                if (r < 0) {
-                        log_debug("could not add new link");
-                        return 0;
-                }
-        }
+        } else
+                link_get(m, ifindex, &link);
 
         r = sd_rtnl_message_read_string(message, IFLA_IFNAME, &name);
-        if (r < 0)
+        if (r < 0 || !name) {
                 log_warning("rtnl: received link message without valid ifname");
-        else {
-                NetDev *netdev;
+                return 0;
+        } else
+                netdev_get(m, name, &netdev);
 
-                r = netdev_get(m, name, &netdev);
-                if (r >= 0) {
+        switch (type) {
+        case RTM_NEWLINK:
+                if (!link) {
+                        /* link is new, so add it */
+                        r = link_add(m, message, &link);
+                        if (r < 0) {
+                                log_debug("could not add new link: %s",
+                                           strerror(-r));
+                                return 0;
+                        }
+                }
+
+                if (netdev) {
+                        /* netdev exists, so make sure the ifindex matches */
                         r = netdev_set_ifindex(netdev, message);
                         if (r < 0) {
                                 log_debug("could not set ifindex on netdev");
                                 return 0;
                         }
                 }
-        }
 
-        r = link_update(link, message);
-        if (r < 0)
-                return 0;
+                r = link_update(link, message);
+                if (r < 0)
+                        return 0;
+
+                break;
+
+        case RTM_DELLINK:
+                link_drop(link);
+                netdev_drop(netdev);
+
+                break;
+
+        default:
+                assert_not_reached("Received invalid RTNL message type.");
+        }
 
         return 1;
 }
@@ -343,11 +379,25 @@ int manager_udev_listen(Manager *m) {
 int manager_rtnl_listen(Manager *m) {
         int r;
 
+        assert(m);
+
         r = sd_rtnl_attach_event(m->rtnl, m->event, 0);
         if (r < 0)
                 return r;
 
         r = sd_rtnl_add_match(m->rtnl, RTM_NEWLINK, &manager_rtnl_process_link, m);
+        if (r < 0)
+                return r;
+
+        r = sd_rtnl_add_match(m->rtnl, RTM_DELLINK, &manager_rtnl_process_link, m);
+        if (r < 0)
+                return r;
+
+        r = sd_rtnl_add_match(m->rtnl, RTM_NEWADDR, &link_rtnl_process_address, m);
+        if (r < 0)
+                return r;
+
+        r = sd_rtnl_add_match(m->rtnl, RTM_DELADDR, &link_rtnl_process_address, m);
         if (r < 0)
                 return r;
 
@@ -369,90 +419,69 @@ int manager_bus_listen(Manager *m) {
         return 0;
 }
 
-static void append_dns(FILE *f, struct in_addr *dns, unsigned char family, unsigned *count) {
-        char buf[INET6_ADDRSTRLEN];
-        const char *address;
-
-        address = inet_ntop(family, dns, buf, INET6_ADDRSTRLEN);
-        if (!address) {
-                log_warning("Invalid DNS address. Ignoring.");
-                return;
-        }
-
-        if (*count == MAXNS)
-                fputs("# Too many DNS servers configured, the following entries "
-                      "will be ignored\n", f);
-
-        fprintf(f, "nameserver %s\n", address);
-
-        (*count) ++;
-}
-
-int manager_update_resolv_conf(Manager *m) {
-        _cleanup_free_ char *temp_path = NULL;
-        _cleanup_fclose_ FILE *f = NULL;
+int manager_save(Manager *m) {
         Link *link;
         Iterator i;
-        unsigned count = 0;
-        const char *domainname = NULL;
+        _cleanup_free_ char *temp_path = NULL;
+        _cleanup_fclose_ FILE *f = NULL;
+        LinkOperationalState operstate = LINK_OPERSTATE_UNKNOWN;
+        const char *operstate_str;
         int r;
 
         assert(m);
+        assert(m->state_file);
 
-        r = fopen_temporary("/run/systemd/network/resolv.conf", &f, &temp_path);
+        HASHMAP_FOREACH(link, m->links, i) {
+                if (link->flags & IFF_LOOPBACK)
+                        continue;
+
+                if (link->operstate > operstate)
+                        operstate = link->operstate;
+        }
+
+        operstate_str = link_operstate_to_string(operstate);
+        assert(operstate_str);
+
+        r = fopen_temporary(m->state_file, &f, &temp_path);
         if (r < 0)
-                return r;
+                goto finish;
 
         fchmod(fileno(f), 0644);
 
-        fputs("# This file is managed by systemd-networkd(8). Do not edit.\n#\n"
-              "# Third party programs must not access this file directly, but\n"
-              "# only through the symlink at /etc/resolv.conf. To manage\n"
-              "# resolv.conf(5) in a different way, replace the symlink by a\n"
-              "# static file or a different symlink.\n\n", f);
-
-        HASHMAP_FOREACH(link, m->links, i) {
-                if (link->dhcp_lease) {
-                        struct in_addr *nameservers;
-                        size_t nameservers_size;
-
-                        if (link->network->dhcp_dns) {
-                                r = sd_dhcp_lease_get_dns(link->dhcp_lease, &nameservers, &nameservers_size);
-                                if (r >= 0) {
-                                        unsigned j;
-
-                                        for (j = 0; j < nameservers_size; j++)
-                                                append_dns(f, &nameservers[j], AF_INET, &count);
-                                }
-                        }
-
-                        if (link->network->dhcp_domainname && !domainname) {
-                                r = sd_dhcp_lease_get_domainname(link->dhcp_lease, &domainname);
-                                if (r >= 0)
-                                       fprintf(f, "domain %s\n", domainname);
-                        }
-                }
-        }
-
-        HASHMAP_FOREACH(link, m->links, i) {
-                if (link->network && link->network->dns) {
-                        Address *address;
-                        Iterator j;
-
-                        SET_FOREACH(address, link->network->dns, j) {
-                                append_dns(f, &address->in_addr.in,
-                                           address->family, &count);
-                        }
-                }
-        }
+        fprintf(f,
+                "# This is private data. Do not parse.\n"
+                "OPER_STATE=%s\n", operstate_str);
 
         fflush(f);
 
-        if (ferror(f) || rename(temp_path, "/run/systemd/network/resolv.conf") < 0) {
+        if (ferror(f) || rename(temp_path, m->state_file) < 0) {
                 r = -errno;
-                unlink("/run/systemd/network/resolv.conf");
+                unlink(m->state_file);
                 unlink(temp_path);
-                return r;
+        }
+
+finish:
+        if (r < 0)
+                log_error("Failed to save network state to %s: %s", m->state_file, strerror(-r));
+
+        return r;
+}
+
+int manager_address_pool_acquire(Manager *m, unsigned family, unsigned prefixlen, union in_addr_union *found) {
+        AddressPool *p;
+        int r;
+
+        assert(m);
+        assert(prefixlen > 0);
+        assert(found);
+
+        LIST_FOREACH(address_pools, p, m->address_pools) {
+                if (p->family != family)
+                        continue;
+
+                r = address_pool_acquire(p, prefixlen, found);
+                if (r != 0)
+                        return r;
         }
 
         return 0;

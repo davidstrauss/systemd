@@ -52,7 +52,7 @@ int route_new_static(Network *network, unsigned section, Route **ret) {
 
         route->network = network;
 
-        LIST_PREPEND(static_routes, network->static_routes, route);
+        LIST_PREPEND(routes, network->static_routes, route);
 
         if (section) {
                 route->section = section;
@@ -86,7 +86,7 @@ void route_free(Route *route) {
                 return;
 
         if (route->network) {
-                LIST_REMOVE(static_routes, route->network->static_routes, route);
+                LIST_REMOVE(routes, route->network->static_routes, route);
 
                 if (route->section)
                         hashmap_remove(route->network->routes_by_section,
@@ -164,6 +164,8 @@ int route_drop(Route *route, Link *link,
                 return r;
         }
 
+        link_ref(link);
+
         return 0;
 }
 
@@ -234,6 +236,8 @@ int route_configure(Route *route, Link *link,
                 log_error("Could not send rtnetlink message: %s", strerror(-r));
                 return r;
         }
+
+        link_ref(link);
 
         return 0;
 }
@@ -351,6 +355,42 @@ int config_parse_destination(const char *unit,
                                 break;
                 }
         }
+
+        n = NULL;
+
+        return 0;
+}
+
+int config_parse_route_priority(const char *unit,
+                                const char *filename,
+                                unsigned line,
+                                const char *section,
+                                unsigned section_line,
+                                const char *lvalue,
+                                int ltype,
+                                const char *rvalue,
+                                void *data,
+                                void *userdata) {
+        Network *network = userdata;
+        _cleanup_route_free_ Route *n = NULL;
+        _cleanup_free_ char *route = NULL;
+        int r;
+
+        assert(filename);
+        assert(section);
+        assert(lvalue);
+        assert(rvalue);
+        assert(data);
+
+        r = route_new_static(network, section_line, &n);
+        if (r < 0)
+                return r;
+
+        r = config_parse_unsigned(unit, filename, line, section,
+                                  section_line, lvalue, ltype,
+                                  rvalue, &n->metrics, userdata);
+        if (r < 0)
+                return r;
 
         n = NULL;
 

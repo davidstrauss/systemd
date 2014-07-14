@@ -40,21 +40,29 @@
 #include "bus-internal.h"
 #include "bus-message.h"
 #include "bus-util.h"
+#include "bus-internal.h"
 #include "build.h"
 #include "strv.h"
 #include "def.h"
+#include "capability.h"
+#include "bus-policy.h"
 
-static const char *arg_address = DEFAULT_SYSTEM_BUS_PATH;
+static char *arg_address = NULL;
 static char *arg_command_line_buffer = NULL;
+static bool arg_drop_privileges = false;
+static char **arg_configuration = NULL;
 
 static int help(void) {
 
         printf("%s [OPTIONS...]\n\n"
                "Connect STDIO or a socket to a given bus address.\n\n"
-               "  -h --help              Show this help\n"
-               "     --version           Show package version\n"
-               "     --address=ADDRESS   Connect to the bus specified by ADDRESS\n"
-               "                         (default: " DEFAULT_SYSTEM_BUS_PATH ")\n",
+               "  -h --help               Show this help\n"
+               "     --version            Show package version\n"
+               "     --drop-privileges    Drop privileges\n"
+               "     --configuration=PATH Configuration file or directory\n"
+               "     --machine=MACHINE    Connect to specified machine\n"
+               "     --address=ADDRESS    Connect to the bus specified by ADDRESS\n"
+               "                          (default: " DEFAULT_SYSTEM_BUS_PATH ")\n",
                program_invocation_short_name);
 
         return 0;
@@ -65,16 +73,22 @@ static int parse_argv(int argc, char *argv[]) {
         enum {
                 ARG_VERSION = 0x100,
                 ARG_ADDRESS,
+                ARG_DROP_PRIVILEGES,
+                ARG_CONFIGURATION,
+                ARG_MACHINE,
         };
 
         static const struct option options[] = {
-                { "help",       no_argument,       NULL, 'h'            },
-                { "version",    no_argument,       NULL, ARG_VERSION    },
-                { "address",    required_argument, NULL, ARG_ADDRESS    },
-                { NULL,         0,                 NULL, 0              }
+                { "help",            no_argument,       NULL, 'h'                 },
+                { "version",         no_argument,       NULL, ARG_VERSION         },
+                { "address",         required_argument, NULL, ARG_ADDRESS         },
+                { "drop-privileges", no_argument,       NULL, ARG_DROP_PRIVILEGES },
+                { "configuration",   required_argument, NULL, ARG_CONFIGURATION   },
+                { "machine",         required_argument, NULL, ARG_MACHINE         },
+                {},
         };
 
-        int c;
+        int c, r;
 
         assert(argc >= 0);
         assert(argv);
@@ -92,9 +106,49 @@ static int parse_argv(int argc, char *argv[]) {
                         puts(SYSTEMD_FEATURES);
                         return 0;
 
-                case ARG_ADDRESS:
-                        arg_address = optarg;
+                case ARG_ADDRESS: {
+                        char *a;
+
+                        a = strdup(optarg);
+                        if (!a)
+                                return log_oom();
+
+                        free(arg_address);
+                        arg_address = a;
                         break;
+                }
+
+                case ARG_DROP_PRIVILEGES:
+                        arg_drop_privileges = true;
+                        break;
+
+                case ARG_CONFIGURATION:
+                        r = strv_extend(&arg_configuration, optarg);
+                        if (r < 0)
+                                return log_oom();
+                        break;
+
+                case ARG_MACHINE: {
+                        _cleanup_free_ char *e = NULL;
+                        char *a;
+
+                        e = bus_address_escape(optarg);
+                        if (!e)
+                                return log_oom();
+
+#ifdef ENABLE_KDBUS
+                        a = strjoin("x-container-kernel:machine=", e, ";x-container-unix:machine=", e, NULL);
+#else
+                        a = strjoin("x-container-unix:machine=", e, NULL);
+#endif
+                        if (!a)
+                                return log_oom();
+
+                        free(arg_address);
+                        arg_address = a;
+
+                        break;
+                }
 
                 case '?':
                         return -EINVAL;
@@ -108,10 +162,15 @@ static int parse_argv(int argc, char *argv[]) {
          * we'll write who we are talking to into it, so that "ps" is
          * explanatory */
         arg_command_line_buffer = argv[optind];
-        if (argc > optind + 1 ||
-            (arg_command_line_buffer && arg_command_line_buffer[strspn(arg_command_line_buffer, "x")] != 0)) {
+        if (argc > optind + 1 || (arg_command_line_buffer && !in_charset(arg_command_line_buffer, "x"))) {
                 log_error("Too many arguments");
                 return -EINVAL;
+        }
+
+        if (!arg_address) {
+                arg_address = strdup(DEFAULT_SYSTEM_BUS_PATH);
+                if (!arg_address)
+                        return log_oom();
         }
 
         return 1;
@@ -259,6 +318,9 @@ static int process_policy(sd_bus *a, sd_bus *b, sd_bus_message *m) {
         assert(a);
         assert(b);
         assert(m);
+
+        if (!a->is_kernel)
+                return 0;
 
         if (!sd_bus_message_is_method_call(m, "org.freedesktop.DBus.Properties", "GetAll"))
                 return 0;
@@ -439,13 +501,15 @@ static int peer_is_privileged(sd_bus *bus, sd_bus_message *m) {
         return false;
 }
 
-
 static int process_driver(sd_bus *a, sd_bus *b, sd_bus_message *m) {
         int r;
 
         assert(a);
         assert(b);
         assert(m);
+
+        if (!a->is_kernel)
+                return 0;
 
         if (!streq_ptr(sd_bus_message_get_destination(m), "org.freedesktop.DBus"))
                 return 0;
@@ -551,7 +615,7 @@ static int process_driver(sd_bus *a, sd_bus *b, sd_bus_message *m) {
                 if (r < 0)
                         return synthetic_reply_method_errno(m, r, NULL);
 
-                r = sd_bus_add_match(a, match, NULL, NULL);
+                r = sd_bus_add_match(a, NULL, match, NULL, NULL);
                 if (r < 0)
                         return synthetic_reply_method_errno(m, r, NULL);
 
@@ -564,7 +628,9 @@ static int process_driver(sd_bus *a, sd_bus *b, sd_bus_message *m) {
                 if (r < 0)
                         return synthetic_reply_method_errno(m, r, NULL);
 
-                r = sd_bus_remove_match(a, match, NULL, NULL);
+                r = bus_remove_match_by_string(a, match, NULL, NULL);
+                if (r == 0)
+                        return synthetic_reply_method_error(m, &SD_BUS_ERROR_MAKE_CONST(SD_BUS_ERROR_MATCH_RULE_NOT_FOUND, "Match rule not found"));
                 if (r < 0)
                         return synthetic_reply_method_errno(m, r, NULL);
 
@@ -739,9 +805,10 @@ static int process_driver(sd_bus *a, sd_bus *b, sd_bus_message *m) {
                 r = sd_bus_release_name(a, name);
                 if (r < 0) {
                         if (r == -ESRCH)
-                                synthetic_reply_method_return(m, "u", BUS_NAME_NON_EXISTENT);
+                                return synthetic_reply_method_return(m, "u", BUS_NAME_NON_EXISTENT);
                         if (r == -EADDRINUSE)
-                                synthetic_reply_method_return(m, "u", BUS_NAME_NOT_OWNER);
+                                return synthetic_reply_method_return(m, "u", BUS_NAME_NOT_OWNER);
+
                         return synthetic_reply_method_errno(m, r, NULL);
                 }
 
@@ -1031,6 +1098,7 @@ int main(int argc, char *argv[]) {
         bool is_unix;
         struct ucred ucred = {};
         _cleanup_free_ char *peersec = NULL;
+        Policy policy = {};
 
         log_set_target(LOG_TARGET_JOURNAL_OR_KMSG);
         log_parse_environment();
@@ -1039,6 +1107,14 @@ int main(int argc, char *argv[]) {
         r = parse_argv(argc, argv);
         if (r <= 0)
                 goto finish;
+
+        r = policy_load(&policy, arg_configuration);
+        if (r < 0) {
+                log_error("Failed to load policy: %s", strerror(-r));
+                goto finish;
+        }
+
+        /* policy_dump(&policy); */
 
         r = sd_listen_fds(0);
         if (r == 0) {
@@ -1059,6 +1135,22 @@ int main(int argc, char *argv[]) {
         if (is_unix) {
                 getpeercred(in_fd, &ucred);
                 getpeersec(in_fd, &peersec);
+        }
+
+        if (arg_drop_privileges) {
+                const char *user = "systemd-bus-proxy";
+                uid_t uid;
+                gid_t gid;
+
+                r = get_user_creds(&user, &uid, &gid, NULL, NULL);
+                if (r < 0) {
+                        log_error("Cannot resolve user name %s: %s", user, strerror(-r));
+                        goto finish;
+                }
+
+                r = drop_privileges(uid, gid, 1ULL << CAP_IPC_OWNER);
+                if (r < 0)
+                        goto finish;
         }
 
         r = sd_bus_new(&a);
@@ -1177,7 +1269,7 @@ int main(int argc, char *argv[]) {
                         goto finish;
                 }
 
-                r = sd_bus_add_match(a, match, NULL, NULL);
+                r = sd_bus_add_match(a, NULL, match, NULL, NULL);
                 if (r < 0) {
                         log_error("Failed to add match for NameLost: %s", strerror(-r));
                         goto finish;
@@ -1198,7 +1290,7 @@ int main(int argc, char *argv[]) {
                         goto finish;
                 }
 
-                r = sd_bus_add_match(a, match, NULL, NULL);
+                r = sd_bus_add_match(a, NULL, match, NULL, NULL);
                 if (r < 0) {
                         log_error("Failed to add match for NameAcquired: %s", strerror(-r));
                         goto finish;
@@ -1385,6 +1477,12 @@ int main(int argc, char *argv[]) {
 finish:
         sd_bus_flush(a);
         sd_bus_flush(b);
+        sd_bus_close(a);
+        sd_bus_close(b);
+
+        policy_free(&policy);
+        strv_free(arg_configuration);
+        free(arg_address);
 
         return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }

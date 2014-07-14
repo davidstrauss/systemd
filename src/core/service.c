@@ -27,6 +27,7 @@
 #include <linux/reboot.h>
 #include <sys/syscall.h>
 
+#include "async.h"
 #include "manager.h"
 #include "unit.h"
 #include "service.h"
@@ -47,41 +48,6 @@
 #include "fileio.h"
 #include "bus-error.h"
 #include "bus-util.h"
-
-#ifdef HAVE_SYSV_COMPAT
-
-#define DEFAULT_SYSV_TIMEOUT_USEC (5*USEC_PER_MINUTE)
-
-typedef enum RunlevelType {
-        RUNLEVEL_UP,
-        RUNLEVEL_DOWN
-} RunlevelType;
-
-static const struct {
-        const char *path;
-        const char *target;
-        const RunlevelType type;
-} rcnd_table[] = {
-        /* Standard SysV runlevels for start-up */
-        { "rc1.d",  SPECIAL_RESCUE_TARGET,    RUNLEVEL_UP },
-        { "rc2.d",  SPECIAL_RUNLEVEL2_TARGET, RUNLEVEL_UP },
-        { "rc3.d",  SPECIAL_RUNLEVEL3_TARGET, RUNLEVEL_UP },
-        { "rc4.d",  SPECIAL_RUNLEVEL4_TARGET, RUNLEVEL_UP },
-        { "rc5.d",  SPECIAL_RUNLEVEL5_TARGET, RUNLEVEL_UP },
-
-        /* Standard SysV runlevels for shutdown */
-        { "rc0.d",  SPECIAL_POWEROFF_TARGET,  RUNLEVEL_DOWN },
-        { "rc6.d",  SPECIAL_REBOOT_TARGET,    RUNLEVEL_DOWN }
-
-        /* Note that the order here matters, as we read the
-           directories in this order, and we want to make sure that
-           sysv_start_priority is known when we first load the
-           unit. And that value we only know from S links. Hence
-           UP must be read before DOWN */
-};
-
-#define RUNLEVELS_UP "12345"
-#endif
 
 static const UnitActiveState state_translation_table[_SERVICE_STATE_MAX] = {
         [SERVICE_DEAD] = UNIT_INACTIVE,
@@ -137,11 +103,6 @@ static void service_init(Unit *u) {
         s->timeout_stop_usec = u->manager->default_timeout_stop_usec;
         s->restart_usec = u->manager->default_restart_usec;
         s->type = _SERVICE_TYPE_INVALID;
-
-#ifdef HAVE_SYSV_COMPAT
-        s->sysv_start_priority = -1;
-        s->sysv_start_priority_from_rcnd = -1;
-#endif
         s->socket_fd = -1;
         s->guess_main_pid = true;
 
@@ -222,7 +183,7 @@ static void service_close_socket_fd(Service *s) {
         if (s->socket_fd < 0)
                 return;
 
-        s->socket_fd = safe_close(s->socket_fd);
+        s->socket_fd = asynchronous_close(s->socket_fd);
 }
 
 static void service_connection_unref(Service *s) {
@@ -294,11 +255,6 @@ static void service_done(Unit *u) {
         free(s->pid_file);
         s->pid_file = NULL;
 
-#ifdef HAVE_SYSV_COMPAT
-        free(s->sysv_runlevels);
-        s->sysv_runlevels = NULL;
-#endif
-
         free(s->status_text);
         s->status_text = NULL;
 
@@ -310,15 +266,9 @@ static void service_done(Unit *u) {
         s->control_command = NULL;
         s->main_command = NULL;
 
-        set_free(s->restart_ignore_status.code);
-        s->restart_ignore_status.code = NULL;
-        set_free(s->restart_ignore_status.signal);
-        s->restart_ignore_status.signal = NULL;
-
-        set_free(s->success_status.code);
-        s->success_status.code = NULL;
-        set_free(s->success_status.signal);
-        s->success_status.signal = NULL;
+        exit_status_set_free(&s->restart_prevent_status);
+        exit_status_set_free(&s->restart_force_status);
+        exit_status_set_free(&s->success_status);
 
         /* This will leak a process, but at least no memory or any of
          * our resources */
@@ -363,727 +313,6 @@ static int service_arm_timer(Service *s, usec_t usec) {
                         service_dispatch_timer, s);
 }
 
-#ifdef HAVE_SYSV_COMPAT
-static char *sysv_translate_name(const char *name) {
-        char *r;
-
-        r = new(char, strlen(name) + strlen(".service") + 1);
-        if (!r)
-                return NULL;
-
-        if (endswith(name, ".sh"))
-                /* Drop .sh suffix */
-                strcpy(stpcpy(r, name) - 3, ".service");
-        else
-                /* Normal init script name */
-                strcpy(stpcpy(r, name), ".service");
-
-        return r;
-}
-
-static int sysv_translate_facility(const char *name, const char *filename, char **_r) {
-
-        /* We silently ignore the $ prefix here. According to the LSB
-         * spec it simply indicates whether something is a
-         * standardized name or a distribution-specific one. Since we
-         * just follow what already exists and do not introduce new
-         * uses or names we don't care who introduced a new name. */
-
-        static const char * const table[] = {
-                /* LSB defined facilities */
-                "local_fs",             NULL,
-                "network",              SPECIAL_NETWORK_TARGET,
-                "named",                SPECIAL_NSS_LOOKUP_TARGET,
-                "portmap",              SPECIAL_RPCBIND_TARGET,
-                "remote_fs",            SPECIAL_REMOTE_FS_TARGET,
-                "syslog",               NULL,
-                "time",                 SPECIAL_TIME_SYNC_TARGET,
-        };
-
-        unsigned i;
-        char *r;
-        const char *n;
-
-        assert(name);
-        assert(_r);
-
-        n = *name == '$' ? name + 1 : name;
-
-        for (i = 0; i < ELEMENTSOF(table); i += 2) {
-
-                if (!streq(table[i], n))
-                        continue;
-
-                if (!table[i+1])
-                        return 0;
-
-                r = strdup(table[i+1]);
-                if (!r)
-                        return log_oom();
-
-                goto finish;
-        }
-
-        /* If we don't know this name, fallback heuristics to figure
-         * out whether something is a target or a service alias. */
-
-        if (*name == '$') {
-                if (!unit_prefix_is_valid(n))
-                        return -EINVAL;
-
-                /* Facilities starting with $ are most likely targets */
-                r = unit_name_build(n, NULL, ".target");
-        } else if (filename && streq(name, filename))
-                /* Names equaling the file name of the services are redundant */
-                return 0;
-        else
-                /* Everything else we assume to be normal service names */
-                r = sysv_translate_name(n);
-
-        if (!r)
-                return -ENOMEM;
-
-finish:
-        *_r = r;
-
-        return 1;
-}
-
-static int sysv_fix_order(Service *s) {
-        Unit *other;
-        int r;
-
-        assert(s);
-
-        if (s->sysv_start_priority < 0)
-                return 0;
-
-        /* For each pair of services where at least one lacks a LSB
-         * header, we use the start priority value to order things. */
-
-        LIST_FOREACH(units_by_type, other, UNIT(s)->manager->units_by_type[UNIT_SERVICE]) {
-                Service *t;
-                UnitDependency d;
-                bool special_s, special_t;
-
-                t = SERVICE(other);
-
-                if (s == t)
-                        continue;
-
-                if (UNIT(t)->load_state != UNIT_LOADED)
-                        continue;
-
-                if (t->sysv_start_priority < 0)
-                        continue;
-
-                /* If both units have modern headers we don't care
-                 * about the priorities */
-                if ((UNIT(s)->fragment_path || s->sysv_has_lsb) &&
-                    (UNIT(t)->fragment_path || t->sysv_has_lsb))
-                        continue;
-
-                special_s = s->sysv_runlevels && !chars_intersect(RUNLEVELS_UP, s->sysv_runlevels);
-                special_t = t->sysv_runlevels && !chars_intersect(RUNLEVELS_UP, t->sysv_runlevels);
-
-                if (special_t && !special_s)
-                        d = UNIT_AFTER;
-                else if (special_s && !special_t)
-                        d = UNIT_BEFORE;
-                else if (t->sysv_start_priority < s->sysv_start_priority)
-                        d = UNIT_AFTER;
-                else if (t->sysv_start_priority > s->sysv_start_priority)
-                        d = UNIT_BEFORE;
-                else
-                        continue;
-
-                /* FIXME: Maybe we should compare the name here lexicographically? */
-
-                if ((r = unit_add_dependency(UNIT(s), d, UNIT(t), true)) < 0)
-                        return r;
-        }
-
-        return 0;
-}
-
-static ExecCommand *exec_command_new(const char *path, const char *arg1) {
-        ExecCommand *c;
-
-        if (!(c = new0(ExecCommand, 1)))
-                return NULL;
-
-        if (!(c->path = strdup(path))) {
-                free(c);
-                return NULL;
-        }
-
-        if (!(c->argv = strv_new(path, arg1, NULL))) {
-                free(c->path);
-                free(c);
-                return NULL;
-        }
-
-        return c;
-}
-
-static int sysv_exec_commands(Service *s, const bool supports_reload) {
-        ExecCommand *c;
-
-        assert(s);
-        assert(s->is_sysv);
-        assert(UNIT(s)->source_path);
-
-        c = exec_command_new(UNIT(s)->source_path, "start");
-        if (!c)
-                return -ENOMEM;
-        exec_command_append_list(s->exec_command+SERVICE_EXEC_START, c);
-
-        c = exec_command_new(UNIT(s)->source_path, "stop");
-        if (!c)
-                return -ENOMEM;
-        exec_command_append_list(s->exec_command+SERVICE_EXEC_STOP, c);
-
-        if (supports_reload) {
-                c = exec_command_new(UNIT(s)->source_path, "reload");
-                if (!c)
-                        return -ENOMEM;
-                exec_command_append_list(s->exec_command+SERVICE_EXEC_RELOAD, c);
-        }
-
-        return 0;
-}
-
-static bool usage_contains_reload(const char *line) {
-        return (strcasestr(line, "{reload|") ||
-                strcasestr(line, "{reload}") ||
-                strcasestr(line, "{reload\"") ||
-                strcasestr(line, "|reload|") ||
-                strcasestr(line, "|reload}") ||
-                strcasestr(line, "|reload\""));
-}
-
-static int service_load_sysv_path(Service *s, const char *path) {
-        FILE *f;
-        Unit *u;
-        unsigned line = 0;
-        int r;
-        enum {
-                NORMAL,
-                DESCRIPTION,
-                LSB,
-                LSB_DESCRIPTION,
-                USAGE_CONTINUATION
-        } state = NORMAL;
-        char *short_description = NULL, *long_description = NULL, *chkconfig_description = NULL, *description;
-        struct stat st;
-        bool supports_reload = false;
-
-        assert(s);
-        assert(path);
-
-        u = UNIT(s);
-
-        f = fopen(path, "re");
-        if (!f) {
-                r = errno == ENOENT ? 0 : -errno;
-                goto finish;
-        }
-
-        if (fstat(fileno(f), &st) < 0) {
-                r = -errno;
-                goto finish;
-        }
-
-        free(u->source_path);
-        u->source_path = strdup(path);
-        if (!u->source_path) {
-                r = -ENOMEM;
-                goto finish;
-        }
-        u->source_mtime = timespec_load(&st.st_mtim);
-
-        if (null_or_empty(&st)) {
-                u->load_state = UNIT_MASKED;
-                r = 0;
-                goto finish;
-        }
-
-        s->is_sysv = true;
-
-        while (!feof(f)) {
-                char l[LINE_MAX], *t;
-
-                if (!fgets(l, sizeof(l), f)) {
-                        if (feof(f))
-                                break;
-
-                        r = -errno;
-                        log_error_unit(u->id,
-                                       "Failed to read configuration file '%s': %s",
-                                       path, strerror(-r));
-                        goto finish;
-                }
-
-                line++;
-
-                t = strstrip(l);
-                if (*t != '#') {
-                        /* Try to figure out whether this init script supports
-                         * the reload operation. This heuristic looks for
-                         * "Usage" lines which include the reload option. */
-                        if ( state == USAGE_CONTINUATION ||
-                            (state == NORMAL && strcasestr(t, "usage"))) {
-                                if (usage_contains_reload(t)) {
-                                        supports_reload = true;
-                                        state = NORMAL;
-                                } else if (t[strlen(t)-1] == '\\')
-                                        state = USAGE_CONTINUATION;
-                                else
-                                        state = NORMAL;
-                        }
-
-                        continue;
-                }
-
-                if (state == NORMAL && streq(t, "### BEGIN INIT INFO")) {
-                        state = LSB;
-                        s->sysv_has_lsb = true;
-                        continue;
-                }
-
-                if ((state == LSB_DESCRIPTION || state == LSB) && streq(t, "### END INIT INFO")) {
-                        state = NORMAL;
-                        continue;
-                }
-
-                t++;
-                t += strspn(t, WHITESPACE);
-
-                if (state == NORMAL) {
-
-                        /* Try to parse Red Hat style chkconfig headers */
-
-                        if (startswith_no_case(t, "chkconfig:")) {
-                                int start_priority;
-                                char runlevels[16], *k;
-
-                                state = NORMAL;
-
-                                if (sscanf(t+10, "%15s %i %*i", runlevels, &start_priority) != 2) {
-                                        log_warning_unit(u->id, "[%s:%u] Failed to parse chkconfig line. Ignoring.", path, line);
-                                        continue;
-                                }
-
-                                /* A start priority gathered from the
-                                 * symlink farms is preferred over the
-                                 * data from the LSB header. */
-                                if (start_priority < 0 || start_priority > 99)
-                                        log_warning_unit(u->id, "[%s:%u] Start priority out of range. Ignoring.", path, line);
-                                else
-                                        log_debug_unit(u->id, "[%s:%u] Ignoring start priority set in the chkconfig file.", path, line);
-
-                                char_array_0(runlevels);
-                                k = delete_chars(runlevels, WHITESPACE "-");
-                                if (k[0]) {
-                                        char *d;
-
-                                        d = strdup(k);
-                                        if (!d) {
-                                                r = -ENOMEM;
-                                                goto finish;
-                                        }
-
-                                        free(s->sysv_runlevels);
-                                        s->sysv_runlevels = d;
-                                }
-
-                        } else if (startswith_no_case(t, "description:")) {
-
-                                size_t k = strlen(t);
-                                char *d;
-                                const char *j;
-
-                                if (t[k-1] == '\\') {
-                                        state = DESCRIPTION;
-                                        t[k-1] = 0;
-                                }
-
-                                if ((j = strstrip(t+12)) && *j) {
-                                        if (!(d = strdup(j))) {
-                                                r = -ENOMEM;
-                                                goto finish;
-                                        }
-                                } else
-                                        d = NULL;
-
-                                free(chkconfig_description);
-                                chkconfig_description = d;
-
-                        } else if (startswith_no_case(t, "pidfile:")) {
-
-                                char *fn;
-
-                                state = NORMAL;
-
-                                fn = strstrip(t+8);
-                                if (!path_is_absolute(fn)) {
-                                        log_warning_unit(u->id,
-                                                         "[%s:%u] PID file not absolute. Ignoring.",
-                                                         path, line);
-                                        continue;
-                                }
-
-                                if (!(fn = strdup(fn))) {
-                                        r = -ENOMEM;
-                                        goto finish;
-                                }
-
-                                free(s->pid_file);
-                                s->pid_file = fn;
-                        }
-
-                } else if (state == DESCRIPTION) {
-
-                        /* Try to parse Red Hat style description
-                         * continuation */
-
-                        size_t k = strlen(t);
-                        char *j;
-
-                        if (t[k-1] == '\\')
-                                t[k-1] = 0;
-                        else
-                                state = NORMAL;
-
-                        if ((j = strstrip(t)) && *j) {
-                                char *d = NULL;
-
-                                if (chkconfig_description)
-                                        d = strjoin(chkconfig_description, " ", j, NULL);
-                                else
-                                        d = strdup(j);
-
-                                if (!d) {
-                                        r = -ENOMEM;
-                                        goto finish;
-                                }
-
-                                free(chkconfig_description);
-                                chkconfig_description = d;
-                        }
-
-                } else if (state == LSB || state == LSB_DESCRIPTION) {
-
-                        if (startswith_no_case(t, "Provides:")) {
-                                char *i, *w;
-                                size_t z;
-
-                                state = LSB;
-
-                                FOREACH_WORD_QUOTED(w, z, t+9, i) {
-                                        char *n, *m;
-
-                                        if (!(n = strndup(w, z))) {
-                                                r = -ENOMEM;
-                                                goto finish;
-                                        }
-
-                                        r = sysv_translate_facility(n, basename(path), &m);
-                                        free(n);
-
-                                        if (r < 0)
-                                                goto finish;
-
-                                        if (r == 0)
-                                                continue;
-
-                                        if (unit_name_to_type(m) == UNIT_SERVICE)
-                                                r = unit_merge_by_name(u, m);
-                                        else
-                                                /* NB: SysV targets
-                                                 * which are provided
-                                                 * by a service are
-                                                 * pulled in by the
-                                                 * services, as an
-                                                 * indication that the
-                                                 * generic service is
-                                                 * now available. This
-                                                 * is strictly
-                                                 * one-way. The
-                                                 * targets do NOT pull
-                                                 * in the SysV
-                                                 * services! */
-                                                r = unit_add_two_dependencies_by_name(u, UNIT_BEFORE, UNIT_WANTS, m, NULL, true);
-
-                                        if (r < 0)
-                                                log_error_unit(u->id,
-                                                               "[%s:%u] Failed to add LSB Provides name %s, ignoring: %s",
-                                                               path, line, m, strerror(-r));
-
-                                        free(m);
-                                }
-
-                        } else if (startswith_no_case(t, "Required-Start:") ||
-                                   startswith_no_case(t, "Should-Start:") ||
-                                   startswith_no_case(t, "X-Start-Before:") ||
-                                   startswith_no_case(t, "X-Start-After:")) {
-                                char *i, *w;
-                                size_t z;
-
-                                state = LSB;
-
-                                FOREACH_WORD_QUOTED(w, z, strchr(t, ':')+1, i) {
-                                        char *n, *m;
-
-                                        if (!(n = strndup(w, z))) {
-                                                r = -ENOMEM;
-                                                goto finish;
-                                        }
-
-                                        r = sysv_translate_facility(n, basename(path), &m);
-                                        if (r < 0) {
-                                                log_error_unit(u->id,
-                                                               "[%s:%u] Failed to translate LSB dependency %s, ignoring: %s",
-                                                               path, line, n, strerror(-r));
-                                                free(n);
-                                                continue;
-                                        }
-
-                                        free(n);
-
-                                        if (r == 0)
-                                                continue;
-
-                                        r = unit_add_dependency_by_name(u, startswith_no_case(t, "X-Start-Before:") ? UNIT_BEFORE : UNIT_AFTER, m, NULL, true);
-
-                                        if (r < 0)
-                                                log_error_unit(u->id, "[%s:%u] Failed to add dependency on %s, ignoring: %s",
-                                                               path, line, m, strerror(-r));
-
-                                        free(m);
-                                }
-                        } else if (startswith_no_case(t, "Default-Start:")) {
-                                char *k, *d;
-
-                                state = LSB;
-
-                                k = delete_chars(t+14, WHITESPACE "-");
-
-                                if (k[0] != 0) {
-                                        if (!(d = strdup(k))) {
-                                                r = -ENOMEM;
-                                                goto finish;
-                                        }
-
-                                        free(s->sysv_runlevels);
-                                        s->sysv_runlevels = d;
-                                }
-
-                        } else if (startswith_no_case(t, "Description:")) {
-                                char *d, *j;
-
-                                state = LSB_DESCRIPTION;
-
-                                if ((j = strstrip(t+12)) && *j) {
-                                        if (!(d = strdup(j))) {
-                                                r = -ENOMEM;
-                                                goto finish;
-                                        }
-                                } else
-                                        d = NULL;
-
-                                free(long_description);
-                                long_description = d;
-
-                        } else if (startswith_no_case(t, "Short-Description:")) {
-                                char *d, *j;
-
-                                state = LSB;
-
-                                if ((j = strstrip(t+18)) && *j) {
-                                        if (!(d = strdup(j))) {
-                                                r = -ENOMEM;
-                                                goto finish;
-                                        }
-                                } else
-                                        d = NULL;
-
-                                free(short_description);
-                                short_description = d;
-
-                        } else if (state == LSB_DESCRIPTION) {
-
-                                if (startswith(l, "#\t") || startswith(l, "#  ")) {
-                                        char *j;
-
-                                        if ((j = strstrip(t)) && *j) {
-                                                char *d = NULL;
-
-                                                if (long_description)
-                                                        d = strjoin(long_description, " ", t, NULL);
-                                                else
-                                                        d = strdup(j);
-
-                                                if (!d) {
-                                                        r = -ENOMEM;
-                                                        goto finish;
-                                                }
-
-                                                free(long_description);
-                                                long_description = d;
-                                        }
-
-                                } else
-                                        state = LSB;
-                        }
-                }
-        }
-
-        if ((r = sysv_exec_commands(s, supports_reload)) < 0)
-                goto finish;
-
-        if (s->sysv_runlevels && !chars_intersect(RUNLEVELS_UP, s->sysv_runlevels)) {
-                /* If there a runlevels configured for this service
-                 * but none of the standard ones, then we assume this
-                 * is some special kind of service (which might be
-                 * needed for early boot) and don't create any links
-                 * to it. */
-
-                UNIT(s)->default_dependencies = false;
-
-                /* Don't timeout special services during boot (like fsck) */
-                s->timeout_start_usec = 0;
-                s->timeout_stop_usec = 0;
-        } else {
-                s->timeout_start_usec = DEFAULT_SYSV_TIMEOUT_USEC;
-                s->timeout_stop_usec = DEFAULT_SYSV_TIMEOUT_USEC;
-        }
-
-        /* Special setting for all SysV services */
-        s->type = SERVICE_FORKING;
-        s->remain_after_exit = !s->pid_file;
-        s->guess_main_pid = false;
-        s->restart = SERVICE_RESTART_NO;
-        s->exec_context.ignore_sigpipe = false;
-        s->kill_context.kill_mode = KILL_PROCESS;
-
-        /* We use the long description only if
-         * no short description is set. */
-
-        if (short_description)
-                description = short_description;
-        else if (chkconfig_description)
-                description = chkconfig_description;
-        else if (long_description)
-                description = long_description;
-        else
-                description = NULL;
-
-        if (description) {
-                char *d;
-
-                if (!(d = strappend(s->sysv_has_lsb ? "LSB: " : "SYSV: ", description))) {
-                        r = -ENOMEM;
-                        goto finish;
-                }
-
-                u->description = d;
-        }
-
-        /* Initialize the start priority from what has been set in the
-         * /etc/rcN.d/ hierarchies if we load the unit file as SysV
-         * init script. */
-        if (s->sysv_start_priority_from_rcnd >= 0)
-                s->sysv_start_priority = s->sysv_start_priority_from_rcnd;
-
-        u->load_state = UNIT_LOADED;
-        r = 0;
-
-finish:
-
-        if (f)
-                fclose(f);
-
-        free(short_description);
-        free(long_description);
-        free(chkconfig_description);
-
-        return r;
-}
-
-static int service_load_sysv_name(Service *s, const char *name) {
-        char **p;
-
-        assert(s);
-        assert(name);
-
-        /* For SysV services we strip the *.sh suffixes. */
-        if (endswith(name, ".sh.service"))
-                return -ENOENT;
-
-        STRV_FOREACH(p, UNIT(s)->manager->lookup_paths.sysvinit_path) {
-                char *path;
-                int r;
-
-                path = strjoin(*p, "/", name, NULL);
-                if (!path)
-                        return -ENOMEM;
-
-                assert(endswith(path, ".service"));
-                path[strlen(path)-8] = 0;
-
-                r = service_load_sysv_path(s, path);
-
-                if (r >= 0 && UNIT(s)->load_state == UNIT_STUB) {
-                        /* Try *.sh source'able init scripts */
-                        strcat(path, ".sh");
-                        r = service_load_sysv_path(s, path);
-                }
-                free(path);
-
-                if (r < 0)
-                        return r;
-
-                if (UNIT(s)->load_state != UNIT_STUB)
-                        break;
-        }
-
-        return 0;
-}
-
-static int service_load_sysv(Service *s) {
-        const char *t;
-        Iterator i;
-        int r;
-
-        assert(s);
-
-        /* Load service data from SysV init scripts, preferably with
-         * LSB headers ... */
-
-        if (strv_isempty(UNIT(s)->manager->lookup_paths.sysvinit_path))
-                return 0;
-
-        if ((t = UNIT(s)->id))
-                if ((r = service_load_sysv_name(s, t)) < 0)
-                        return r;
-
-        if (UNIT(s)->load_state == UNIT_STUB)
-                SET_FOREACH(t, UNIT(s)->names, i) {
-                        if (t == UNIT(s)->id)
-                                continue;
-
-                        if ((r = service_load_sysv_name(s, t)) < 0)
-                                return r;
-
-                        if (UNIT(s)->load_state != UNIT_STUB)
-                                break;
-                }
-
-        return 0;
-}
-#endif
-
 static int service_verify(Service *s) {
         assert(s);
 
@@ -1102,7 +331,12 @@ static int service_verify(Service *s) {
         }
 
         if (s->type == SERVICE_ONESHOT && s->restart != SERVICE_RESTART_NO) {
-                log_error_unit(UNIT(s)->id, "%s has Restart setting other than no, which isn't allowed for Type=oneshot services. Refusing.", UNIT(s)->id);
+                log_error_unit(UNIT(s)->id, "%s has Restart= setting other than no, which isn't allowed for Type=oneshot services. Refusing.", UNIT(s)->id);
+                return -EINVAL;
+        }
+
+        if (s->type == SERVICE_ONESHOT && !exit_status_set_is_empty(&s->restart_force_status)) {
+                log_error_unit(UNIT(s)->id, "%s has RestartForceStatus= set, which isn't allowed for Type=oneshot services. Refusing.", UNIT(s)->id);
                 return -EINVAL;
         }
 
@@ -1171,15 +405,6 @@ static int service_load(Unit *u) {
         if (r < 0)
                 return r;
 
-#ifdef HAVE_SYSV_COMPAT
-        /* Load a classic init script as a fallback, if we couldn't find anything */
-        if (u->load_state == UNIT_STUB) {
-                r = service_load_sysv(s);
-                if (r < 0)
-                        return r;
-        }
-#endif
-
         /* Still nothing found? Then let's give up */
         if (u->load_state == UNIT_STUB)
                 return -ENOENT;
@@ -1214,12 +439,6 @@ static int service_load(Unit *u) {
                 if (r < 0)
                         return r;
 
-#ifdef HAVE_SYSV_COMPAT
-                r = sysv_fix_order(s);
-                if (r < 0)
-                        return r;
-#endif
-
                 if (s->type == SERVICE_NOTIFY && s->notify_access == NOTIFY_NONE)
                         s->notify_access = NOTIFY_MAIN;
 
@@ -1235,6 +454,7 @@ static int service_load(Unit *u) {
                 if (u->default_dependencies) {
                         r = service_add_default_dependencies(s);
                         if (r < 0)
+
                                 return r;
                 }
         }
@@ -1317,21 +537,10 @@ static void service_dump(Unit *u, FILE *f, const char *prefix) {
         }
 
 #ifdef HAVE_SYSV_COMPAT
-        if (s->is_sysv)
-                fprintf(f,
-                        "%sSysV Init Script has LSB Header: %s\n"
-                        "%sSysVEnabled: %s\n",
-                        prefix, yes_no(s->sysv_has_lsb),
-                        prefix, yes_no(s->sysv_enabled));
-
         if (s->sysv_start_priority >= 0)
                 fprintf(f,
                         "%sSysVStartPriority: %i\n",
                         prefix, s->sysv_start_priority);
-
-        if (s->sysv_runlevels)
-                fprintf(f, "%sSysVRunLevels: %s\n",
-                        prefix, s->sysv_runlevels);
 #endif
 
         if (s->status_text)
@@ -1859,13 +1068,13 @@ static void service_enter_dead(Service *s, ServiceResult f, bool allow_restart) 
             (s->restart == SERVICE_RESTART_ALWAYS ||
              (s->restart == SERVICE_RESTART_ON_SUCCESS && s->result == SERVICE_SUCCESS) ||
              (s->restart == SERVICE_RESTART_ON_FAILURE && s->result != SERVICE_SUCCESS) ||
+             (s->restart == SERVICE_RESTART_ON_ABNORMAL && !IN_SET(s->result, SERVICE_SUCCESS, SERVICE_FAILURE_EXIT_CODE)) ||
              (s->restart == SERVICE_RESTART_ON_WATCHDOG && s->result == SERVICE_FAILURE_WATCHDOG) ||
-             (s->restart == SERVICE_RESTART_ON_ABORT && (s->result == SERVICE_FAILURE_SIGNAL ||
-                                                         s->result == SERVICE_FAILURE_CORE_DUMP))) &&
-            (s->result != SERVICE_FAILURE_EXIT_CODE ||
-             !set_contains(s->restart_ignore_status.code, INT_TO_PTR(s->main_exec_status.status))) &&
-            (s->result != SERVICE_FAILURE_SIGNAL ||
-             !set_contains(s->restart_ignore_status.signal, INT_TO_PTR(s->main_exec_status.status)))) {
+             (s->restart == SERVICE_RESTART_ON_ABORT && IN_SET(s->result, SERVICE_FAILURE_SIGNAL, SERVICE_FAILURE_CORE_DUMP)) ||
+             (s->main_exec_status.code == CLD_EXITED && set_contains(s->restart_force_status.status, INT_TO_PTR(s->main_exec_status.status))) ||
+             (IN_SET(s->main_exec_status.code, CLD_KILLED, CLD_DUMPED) && set_contains(s->restart_force_status.signal, INT_TO_PTR(s->main_exec_status.status)))) &&
+            (s->main_exec_status.code != CLD_EXITED || !set_contains(s->restart_prevent_status.status, INT_TO_PTR(s->main_exec_status.status))) &&
+            (!IN_SET(s->main_exec_status.code, CLD_KILLED, CLD_DUMPED) || !set_contains(s->restart_prevent_status.signal, INT_TO_PTR(s->main_exec_status.status)))) {
 
                 r = service_arm_timer(s, s->restart_usec);
                 if (r < 0)
@@ -2211,8 +1420,7 @@ static void service_enter_start_pre(Service *s) {
         return;
 
 fail:
-        log_warning_unit(UNIT(s)->id,
-                         "%s failed to run 'start-pre' task: %s", UNIT(s)->id, strerror(-r));
+        log_warning_unit(UNIT(s)->id, "%s failed to run 'start-pre' task: %s", UNIT(s)->id, strerror(-r));
         service_enter_dead(s, SERVICE_FAILURE_RESOURCES, true);
 }
 
@@ -2224,8 +1432,7 @@ static void service_enter_restart(Service *s) {
 
         if (UNIT(s)->job && UNIT(s)->job->type == JOB_STOP) {
                 /* Don't restart things if we are going down anyway */
-                log_info_unit(UNIT(s)->id,
-                              "Stop job pending for unit, delaying automatic restart.");
+                log_info_unit(UNIT(s)->id, "Stop job pending for unit, delaying automatic restart.");
 
                 r = service_arm_timer(s, s->restart_usec);
                 if (r < 0)
@@ -2246,8 +1453,7 @@ static void service_enter_restart(Service *s) {
          * it will be canceled as part of the service_stop() call that
          * is executed as part of JOB_RESTART. */
 
-        log_debug_unit(UNIT(s)->id,
-                       "%s scheduled restart job.", UNIT(s)->id);
+        log_debug_unit(UNIT(s)->id, "%s scheduled restart job.", UNIT(s)->id);
         return;
 
 fail:
@@ -2493,6 +1699,10 @@ static int service_start(Unit *u) {
         s->main_pid_alien = false;
         s->forbid_restart = false;
 
+        free(s->status_text);
+        s->status_text = NULL;
+        s->status_errno = 0;
+
         service_enter_start_pre(s);
         return 0;
 }
@@ -2705,7 +1915,7 @@ static int service_deserialize_item(Unit *u, const char *key, const char *value,
                         log_debug_unit(u->id, "Failed to parse socket-fd value %s", value);
                 else {
 
-                        safe_close(s->socket_fd);
+                        asynchronous_close(s->socket_fd);
                         s->socket_fd = fdset_remove(fds, fd);
                 }
         } else if (streq(key, "main-exec-status-pid")) {
@@ -2776,11 +1986,6 @@ static bool service_check_gc(Unit *u) {
             main_pid_good(s) > 0 ||
             control_pid_good(s) > 0)
                 return true;
-
-#ifdef HAVE_SYSV_COMPAT
-        if (s->is_sysv)
-                return true;
-#endif
 
         return false;
 }
@@ -3374,7 +2579,6 @@ static void service_notify_message(Unit *u, pid_t pid, char **tags) {
         }
 
         if (s->notify_access == NOTIFY_MAIN && pid != s->main_pid) {
-
                 if (s->main_pid != 0)
                         log_warning_unit(u->id, "%s: Got notification message from PID "PID_FMT", but reception only permitted for main PID "PID_FMT, u->id, pid, s->main_pid);
                 else
@@ -3383,14 +2587,10 @@ static void service_notify_message(Unit *u, pid_t pid, char **tags) {
         }
 
         /* Interpret MAINPID= */
-        if ((e = strv_find_prefix(tags, "MAINPID=")) &&
-            (s->state == SERVICE_START ||
-             s->state == SERVICE_START_POST ||
-             s->state == SERVICE_RUNNING ||
-             s->state == SERVICE_RELOAD)) {
-
+        e = strv_find_prefix(tags, "MAINPID=");
+        if (e && IN_SET(s->state, SERVICE_START, SERVICE_START_POST, SERVICE_RUNNING, SERVICE_RELOAD)) {
                 if (parse_pid(e + 8, &pid) < 0)
-                        log_warning_unit(u->id, "Failed to parse notification message %s", e);
+                        log_warning_unit(u->id, "Failed to parse MAINPID= field in notification message: %s", e);
                 else {
                         log_debug_unit(u->id, "%s: got %s", u->id, e);
                         service_set_main_pid(s, pid);
@@ -3436,6 +2636,23 @@ static void service_notify_message(Unit *u, pid_t pid, char **tags) {
                         free(t);
         }
 
+        /* Interpret ERRNO= */
+        e = strv_find_prefix(tags, "ERRNO=");
+        if (e) {
+                int status_errno;
+
+                if (safe_atoi(e + 6, &status_errno) < 0 || status_errno < 0)
+                        log_warning_unit(u->id, "Failed to parse ERRNO= field in notification message: %s", e);
+                else {
+                        log_debug_unit(u->id, "%s: got %s", u->id, e);
+
+                        if (s->status_errno != status_errno) {
+                                s->status_errno = status_errno;
+                                notify_dbus = true;
+                        }
+                }
+        }
+
         /* Interpret WATCHDOG= */
         if (strv_find(tags, "WATCHDOG=1")) {
                 log_debug_unit(u->id, "%s: got WATCHDOG=1", u->id);
@@ -3460,176 +2677,6 @@ static int service_get_timeout(Unit *u, uint64_t *timeout) {
 
         return 1;
 }
-
-#ifdef HAVE_SYSV_COMPAT
-
-static int service_enumerate(Manager *m) {
-        char **p;
-        unsigned i;
-        _cleanup_closedir_ DIR *d = NULL;
-        _cleanup_free_ char *path = NULL, *fpath = NULL, *name = NULL;
-        Set *runlevel_services[ELEMENTSOF(rcnd_table)] = {};
-        _cleanup_set_free_ Set *shutdown_services = NULL;
-        Unit *service;
-        Iterator j;
-        int r;
-
-        assert(m);
-
-        if (m->running_as != SYSTEMD_SYSTEM)
-                return 0;
-
-        STRV_FOREACH(p, m->lookup_paths.sysvrcnd_path)
-                for (i = 0; i < ELEMENTSOF(rcnd_table); i ++) {
-                        struct dirent *de;
-
-                        free(path);
-                        path = strjoin(*p, "/", rcnd_table[i].path, NULL);
-                        if (!path) {
-                                r = -ENOMEM;
-                                goto finish;
-                        }
-
-                        if (d)
-                                closedir(d);
-
-                        d = opendir(path);
-                        if (!d) {
-                                if (errno != ENOENT)
-                                        log_warning("opendir(%s) failed: %m", path);
-
-                                continue;
-                        }
-
-                        while ((de = readdir(d))) {
-                                int a, b;
-
-                                if (ignore_file(de->d_name))
-                                        continue;
-
-                                if (de->d_name[0] != 'S' && de->d_name[0] != 'K')
-                                        continue;
-
-                                if (strlen(de->d_name) < 4)
-                                        continue;
-
-                                a = undecchar(de->d_name[1]);
-                                b = undecchar(de->d_name[2]);
-
-                                if (a < 0 || b < 0)
-                                        continue;
-
-                                free(fpath);
-                                fpath = strjoin(path, "/", de->d_name, NULL);
-                                if (!fpath) {
-                                        r = -ENOMEM;
-                                        goto finish;
-                                }
-
-                                if (access(fpath, X_OK) < 0) {
-
-                                        if (errno != ENOENT)
-                                                log_warning("access() failed on %s: %m", fpath);
-
-                                        continue;
-                                }
-
-                                free(name);
-                                name = sysv_translate_name(de->d_name + 3);
-                                if (!name) {
-                                        r = log_oom();
-                                        goto finish;
-                                }
-
-                                r = manager_load_unit_prepare(m, name, NULL, NULL, &service);
-                                if (r < 0) {
-                                        log_warning("Failed to prepare unit %s: %s", name, strerror(-r));
-                                        continue;
-                                }
-
-                                if (de->d_name[0] == 'S')  {
-
-                                        if (rcnd_table[i].type == RUNLEVEL_UP) {
-                                                SERVICE(service)->sysv_start_priority_from_rcnd =
-                                                        MAX(a*10 + b, SERVICE(service)->sysv_start_priority_from_rcnd);
-
-                                                SERVICE(service)->sysv_enabled = true;
-                                        }
-
-                                        r = set_ensure_allocated(&runlevel_services[i],
-                                                                 trivial_hash_func, trivial_compare_func);
-                                        if (r < 0)
-                                                goto finish;
-
-                                        r = set_put(runlevel_services[i], service);
-                                        if (r < 0)
-                                                goto finish;
-
-                                } else if (de->d_name[0] == 'K' &&
-                                           (rcnd_table[i].type == RUNLEVEL_DOWN)) {
-
-                                        r = set_ensure_allocated(&shutdown_services,
-                                                                 trivial_hash_func, trivial_compare_func);
-                                        if (r < 0)
-                                                goto finish;
-
-                                        r = set_put(shutdown_services, service);
-                                        if (r < 0)
-                                                goto finish;
-                                }
-                        }
-                }
-
-        /* Now we loaded all stubs and are aware of the lowest
-        start-up priority for all services, not let's actually load
-        the services, this will also tell us which services are
-        actually native now */
-        manager_dispatch_load_queue(m);
-
-        /* If this is a native service, rely on native ways to pull in
-         * a service, don't pull it in via sysv rcN.d links. */
-        for (i = 0; i < ELEMENTSOF(rcnd_table); i ++)
-                SET_FOREACH(service, runlevel_services[i], j) {
-                        service = unit_follow_merge(service);
-
-                        if (service->fragment_path)
-                                continue;
-
-                        r = unit_add_two_dependencies_by_name_inverse(
-                                service, UNIT_AFTER, UNIT_WANTS,
-                                rcnd_table[i].target, NULL, true);
-                        if (r < 0)
-                                goto finish;
-                }
-
-        /* We honour K links only for halt/reboot. For the normal
-         * runlevels we assume the stop jobs will be implicitly added
-         * by the core logic. Also, we don't really distinguish here
-         * between the runlevels 0 and 6 and just add them to the
-         * special shutdown target. */
-        SET_FOREACH(service, shutdown_services, j) {
-                service = unit_follow_merge(service);
-
-                if (service->fragment_path)
-                        continue;
-
-                r = unit_add_two_dependencies_by_name(
-                        service, UNIT_BEFORE, UNIT_CONFLICTS,
-                        SPECIAL_SHUTDOWN_TARGET, NULL, true);
-                if (r < 0)
-                        goto finish;
-        }
-
-        r = 0;
-
-finish:
-
-        for (i = 0; i < ELEMENTSOF(rcnd_table); i++)
-                set_free(runlevel_services[i]);
-
-        return r;
-}
-#endif
 
 static void service_bus_name_owner_change(
                 Unit *u,
@@ -3782,9 +2829,10 @@ static const char* const service_restart_table[_SERVICE_RESTART_MAX] = {
         [SERVICE_RESTART_NO] = "no",
         [SERVICE_RESTART_ON_SUCCESS] = "on-success",
         [SERVICE_RESTART_ON_FAILURE] = "on-failure",
+        [SERVICE_RESTART_ON_ABNORMAL] = "on-abnormal",
         [SERVICE_RESTART_ON_WATCHDOG] = "on-watchdog",
         [SERVICE_RESTART_ON_ABORT] = "on-abort",
-        [SERVICE_RESTART_ALWAYS] = "always"
+        [SERVICE_RESTART_ALWAYS] = "always",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(service_restart, ServiceRestart);
@@ -3893,11 +2941,6 @@ const UnitVTable service_vtable = {
         .bus_commit_properties = bus_service_commit_properties,
 
         .get_timeout = service_get_timeout,
-
-#ifdef HAVE_SYSV_COMPAT
-        .enumerate = service_enumerate,
-#endif
-
         .can_transient = true,
 
         .status_message_formats = {

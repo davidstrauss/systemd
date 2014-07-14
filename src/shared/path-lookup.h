@@ -21,6 +21,8 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include "macro.h"
+
 typedef struct LookupPaths {
         char **unit_path;
 #ifdef HAVE_SYSV_COMPAT
@@ -43,5 +45,11 @@ SystemdRunningAs systemd_running_as_from_string(const char *s) _pure_;
 
 int user_config_home(char **config_home);
 
-int lookup_paths_init(LookupPaths *p, SystemdRunningAs running_as, bool personal, const char *generator, const char *generator_early, const char *generator_late);
+int lookup_paths_init(LookupPaths *p,
+                      SystemdRunningAs running_as,
+                      bool personal,
+                      const char *root_dir,
+                      const char *generator,
+                      const char *generator_early,
+                      const char *generator_late);
 void lookup_paths_free(LookupPaths *p);

@@ -61,7 +61,7 @@
 #include "capability.h"
 #include "killall.h"
 #include "env-util.h"
-#include "hwclock.h"
+#include "clock-util.h"
 #include "fileio.h"
 #include "dbus-manager.h"
 #include "bus-error.h"
@@ -109,7 +109,6 @@ static struct rlimit *arg_default_rlimit[_RLIMIT_MAX] = {};
 static uint64_t arg_capability_bounding_set_drop = 0;
 static nsec_t arg_timer_slack_nsec = (nsec_t) -1;
 static usec_t arg_default_timer_accuracy_usec = 1 * USEC_PER_MINUTE;
-static usec_t arg_default_cpu_quota_period_usec = 100 * USEC_PER_MSEC;
 static Set* arg_syscall_archs = NULL;
 static FILE* arg_serialization = NULL;
 static bool arg_default_cpu_accounting = false;
@@ -287,7 +286,8 @@ static int parse_proc_cmdline_item(const char *key, const char *value) {
 
         } else if (streq(key, "rd.systemd.unit") && value) {
 
-                return set_default_unit(value);
+                if (in_initrd())
+                        return set_default_unit(value);
 
         } else if (streq(key, "systemd.log_target") && value) {
 
@@ -375,49 +375,17 @@ static int parse_proc_cmdline_item(const char *key, const char *value) {
                 } else
                         log_warning("Environment variable name '%s' is not valid. Ignoring.", value);
 
-        } else if (!streq(key, "systemd.restore_state") &&
-                   !streq(key, "systemd.gpt_auto") &&
-                   (startswith(key, "systemd.") || startswith(key, "rd.systemd."))) {
-
-                const char *c;
-
-                /* Ignore systemd.journald.xyz and friends */
-                c = key;
-                if (startswith(c, "rd."))
-                        c += 3;
-                if (startswith(c, "systemd."))
-                        c += 8;
-                if (c[strcspn(c, ".=")] != '.')  {
-
-                        log_warning("Unknown kernel switch %s. Ignoring.", key);
-
-                        log_info("Supported kernel switches:\n"
-                                 "systemd.unit=UNIT                        Default unit to start\n"
-                                 "rd.systemd.unit=UNIT                     Default unit to start when run in initrd\n"
-                                 "systemd.dump_core=0|1                    Dump core on crash\n"
-                                 "systemd.crash_shell=0|1                  Run shell on crash\n"
-                                 "systemd.crash_chvt=N                     Change to VT #N on crash\n"
-                                 "systemd.confirm_spawn=0|1                Confirm every process spawn\n"
-                                 "systemd.show_status=0|1|auto             Show status updates on the console during bootup\n"
-                                 "systemd.log_target=console|kmsg|journal|journal-or-kmsg|syslog|syslog-or-kmsg|null\n"
-                                 "                                         Log target\n"
-                                 "systemd.log_level=LEVEL                  Log level\n"
-                                 "systemd.log_color=0|1                    Highlight important log messages\n"
-                                 "systemd.log_location=0|1                 Include code location in log messages\n"
-                                 "systemd.default_standard_output=null|tty|syslog|syslog+console|kmsg|kmsg+console|journal|journal+console\n"
-                                 "                                         Set default log output for services\n"
-                                 "systemd.default_standard_error=null|tty|syslog|syslog+console|kmsg|kmsg+console|journal|journal+console\n"
-                                 "                                         Set default log error output for services\n"
-                                 "systemd.setenv=ASSIGNMENT                Set an environment variable for all spawned processes\n"
-                                 "systemd.restore_state=0|1                Restore backlight/rfkill state at boot\n");
-                }
-
         } else if (streq(key, "quiet") && !value) {
+
+                log_set_max_level(LOG_NOTICE);
+
                 if (arg_show_status == _SHOW_STATUS_UNSET)
                         arg_show_status = SHOW_STATUS_AUTO;
 
         } else if (streq(key, "debug") && !value) {
+
                 log_set_max_level(LOG_DEBUG);
+
                 if (detect_container(NULL) > 0)
                         log_set_target(LOG_TARGET_CONSOLE);
 
@@ -684,7 +652,6 @@ static int parse_config_file(void) {
 #endif
                 { "Manager", "TimerSlackNSec",            config_parse_nsec,             0, &arg_timer_slack_nsec                  },
                 { "Manager", "DefaultTimerAccuracySec",   config_parse_sec,              0, &arg_default_timer_accuracy_usec       },
-                { "Manager", "DefaultCPUQuotaPeriodSec",  config_parse_sec,              0, &arg_default_cpu_quota_period_usec     },
                 { "Manager", "DefaultStandardOutput",     config_parse_output,           0, &arg_default_std_output                },
                 { "Manager", "DefaultStandardError",      config_parse_output,           0, &arg_default_std_error                 },
                 { "Manager", "DefaultTimeoutStartSec",    config_parse_sec,              0, &arg_default_timeout_start_usec        },
@@ -1153,19 +1120,25 @@ static int bump_rlimit_nofile(struct rlimit *saved_rlimit) {
 }
 
 static void test_mtab(void) {
-        char *p;
 
-        /* Check that /etc/mtab is a symlink */
+        static const char ok[] =
+                "/proc/self/mounts\0"
+                "/proc/mounts\0"
+                "../proc/self/mounts\0"
+                "../proc/mounts\0";
 
-        if (readlink_malloc("/etc/mtab", &p) >= 0) {
-                bool b;
+        _cleanup_free_ char *p = NULL;
+        int r;
 
-                b = streq(p, "/proc/self/mounts") || streq(p, "/proc/mounts");
-                free(p);
+        /* Check that /etc/mtab is a symlink to the right place or
+         * non-existing. But certainly not a file, or a symlink to
+         * some weird place... */
 
-                if (b)
-                        return;
-        }
+        r = readlink_malloc("/etc/mtab", &p);
+        if (r == -ENOENT)
+                return;
+        if (r >= 0 && nulstr_contains(ok, p))
+                return;
 
         log_warning("/etc/mtab is not a symlink or not pointing to /proc/self/mounts. "
                     "This is not supported anymore. "
@@ -1182,21 +1155,6 @@ static void test_usr(void) {
         log_warning("/usr appears to be on its own filesytem and is not already mounted. This is not a supported setup. "
                     "Some things will probably break (sometimes even silently) in mysterious ways. "
                     "Consult http://freedesktop.org/wiki/Software/systemd/separate-usr-is-broken for more information.");
-}
-
-static void test_cgroups(void) {
-
-        if (access("/proc/cgroups", F_OK) >= 0)
-                return;
-
-        log_warning("CONFIG_CGROUPS was not set when your kernel was compiled. "
-                    "Systems without control groups are not supported. "
-                    "We will now sleep for 10s, and then continue boot-up. "
-                    "Expect breakage and please do not file bugs. "
-                    "Instead fix your kernel and enable CONFIG_CGROUPS. "
-                    "Consult http://0pointer.de/blog/projects/cgroups-vs-cgroups.html for more information.");
-
-        sleep(10);
 }
 
 static int initialize_join_controllers(void) {
@@ -1268,14 +1226,30 @@ static int status_welcome(void) {
                            "PRETTY_NAME", &pretty_name,
                            "ANSI_COLOR", &ansi_color,
                            NULL);
+        if (r == -ENOENT) {
+                r = parse_env_file("/usr/lib/os-release", NEWLINE,
+                                   "PRETTY_NAME", &pretty_name,
+                                   "ANSI_COLOR", &ansi_color,
+                                   NULL);
+        }
 
         if (r < 0 && r != -ENOENT)
-                log_warning("Failed to read /etc/os-release: %s", strerror(-r));
+                log_warning("Failed to read os-release file: %s", strerror(-r));
 
         return status_printf(NULL, false, false,
                              "\nWelcome to \x1B[%sm%s\x1B[0m!\n",
                              isempty(ansi_color) ? "1" : ansi_color,
                              isempty(pretty_name) ? "Linux" : pretty_name);
+}
+
+static int write_container_id(void) {
+        const char *c;
+
+        c = getenv("container");
+        if (isempty(c))
+                return 0;
+
+        return write_string_file("/run/systemd/container", c);
 }
 
 int main(int argc, char *argv[]) {
@@ -1297,6 +1271,7 @@ int main(int argc, char *argv[]) {
         bool loaded_policy = false;
         bool arm_reboot_watchdog = false;
         bool queue_default_job = false;
+        bool empty_etc = false;
         char *switch_root_dir = NULL, *switch_root_init = NULL;
         static struct rlimit saved_rlimit_nofile = { 0, 0 };
 
@@ -1369,11 +1344,11 @@ int main(int argc, char *argv[]) {
                         goto finish;
 
                 if (!skip_setup) {
-                        if (hwclock_is_localtime() > 0) {
+                        if (clock_is_localtime() > 0) {
                                 int min;
 
                                 /* The first-time call to settimeofday() does a time warp in the kernel */
-                                r = hwclock_set_timezone(&min);
+                                r = clock_set_timezone(&min);
                                 if (r < 0)
                                         log_error("Failed to apply local time delta, ignoring: %s", strerror(-r));
                                 else
@@ -1387,10 +1362,10 @@ int main(int argc, char *argv[]) {
                                  * that way. In such case, we need to delay the time-warp or the sealing
                                  * until we reach the real system.
                                  */
-                                hwclock_reset_timezone();
+                                clock_reset_timezone();
 
                                 /* Tell the kernel our timezone */
-                                r = hwclock_set_timezone(NULL);
+                                r = clock_set_timezone(NULL);
                                 if (r < 0)
                                         log_error("Failed to set the kernel's timezone, ignoring: %s", strerror(-r));
                         }
@@ -1561,15 +1536,29 @@ int main(int argc, char *argv[]) {
                 if (virtualization)
                         log_info("Detected virtualization '%s'.", virtualization);
 
+                write_container_id();
+
                 log_info("Detected architecture '%s'.", architecture_to_string(uname_architecture()));
 
                 if (in_initrd())
                         log_info("Running in initial RAM disk.");
 
+                /* Let's check whether /etc is already populated. We
+                 * don't actually really check for that, but use
+                 * /etc/machine-id as flag file. This allows container
+                 * managers and installers to provision a couple of
+                 * files already. If the container manager wants to
+                 * provision the machine ID itself it should pass
+                 * $container_uuid to PID 1.*/
+
+                empty_etc = access("/etc/machine-id", F_OK) < 0;
+                if (empty_etc)
+                        log_info("Running with unpopulated /etc.");
         } else {
-                _cleanup_free_ char *t = uid_to_name(getuid());
-                log_debug(PACKAGE_STRING " running in user mode for user "PID_FMT"/%s. (" SYSTEMD_FEATURES ")",
-                          getuid(), t);
+                _cleanup_free_ char *t;
+
+                t = uid_to_name(getuid());
+                log_debug(PACKAGE_STRING " running in user mode for user "UID_FMT"/%s. (" SYSTEMD_FEATURES ")", getuid(), strna(t));
         }
 
         if (arg_running_as == SYSTEMD_SYSTEM && !skip_setup) {
@@ -1577,16 +1566,14 @@ int main(int argc, char *argv[]) {
                         status_welcome();
 
 #ifdef HAVE_KMOD
-                if (detect_container(NULL) <= 0)
-                        kmod_setup();
+                kmod_setup();
 #endif
                 hostname_setup();
-                machine_id_setup("");
+                machine_id_setup(NULL);
                 loopback_setup();
 
                 test_mtab();
                 test_usr();
-                test_cgroups();
         }
 
         if (arg_running_as == SYSTEMD_SYSTEM && arg_runtime_watchdog > 0)
@@ -1624,8 +1611,17 @@ int main(int argc, char *argv[]) {
                 }
         }
 
-        if (arg_running_as == SYSTEMD_SYSTEM)
+        if (arg_running_as == SYSTEMD_SYSTEM) {
                 bump_rlimit_nofile(&saved_rlimit_nofile);
+
+                if (empty_etc) {
+                        r = unit_file_preset_all(UNIT_FILE_SYSTEM, false, NULL, UNIT_FILE_PRESET_FULL, false, NULL, 0);
+                        if (r < 0)
+                                log_warning("Failed to populate /etc with preset unit settings, ignoring: %s", strerror(-r));
+                        else
+                                log_info("Populated /etc with preset unit settings.");
+                }
+        }
 
         r = manager_new(arg_running_as, &m);
         if (r < 0) {
@@ -1635,7 +1631,6 @@ int main(int argc, char *argv[]) {
 
         m->confirm_spawn = arg_confirm_spawn;
         m->default_timer_accuracy_usec = arg_default_timer_accuracy_usec;
-        m->default_cpu_quota_period_usec = arg_default_cpu_quota_period_usec;
         m->default_std_output = arg_default_std_output;
         m->default_std_error = arg_default_std_error;
         m->default_restart_usec = arg_default_restart_usec;
@@ -1657,6 +1652,7 @@ int main(int argc, char *argv[]) {
         manager_set_default_rlimits(m, arg_default_rlimit);
         manager_environment_add(m, NULL, arg_default_environment);
         manager_set_show_status(m, arg_show_status);
+        manager_set_first_boot(m, empty_etc);
 
         /* Remember whether we should queue the default job */
         queue_default_job = !arg_serialization || arg_switched_root;
@@ -1838,6 +1834,7 @@ finish:
         if (reexecute) {
                 const char **args;
                 unsigned i, args_size;
+                sigset_t ss;
 
                 /* Close and disarm the watchdog, so that the new
                  * instance can reinitialize it, but doesn't get
@@ -1920,6 +1917,13 @@ finish:
                         args[i++] = argv[j];
                 args[i++] = NULL;
                 assert(i <= args_size);
+
+                /* reenable any blocked signals, especially important
+                 * if we switch from initial ramdisk to init=... */
+                reset_all_signal_handlers();
+
+                assert_se(sigemptyset(&ss) == 0);
+                assert_se(sigprocmask(SIG_SETMASK, &ss, NULL) == 0);
 
                 if (switch_root_init) {
                         args[0] = switch_root_init;

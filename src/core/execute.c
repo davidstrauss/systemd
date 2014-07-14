@@ -561,7 +561,7 @@ static int restore_confirm_stdio(int *saved_stdin,
 
 static int ask_for_confirmation(char *response, char **argv) {
         int saved_stdout = -1, saved_stdin = -1, r;
-        char *line;
+        _cleanup_free_ char *line = NULL;
 
         r = setup_confirm_stdio(&saved_stdin, &saved_stdout);
         if (r < 0)
@@ -571,8 +571,7 @@ static int ask_for_confirmation(char *response, char **argv) {
         if (!line)
                 return -ENOMEM;
 
-        r = ask(response, "yns", "Execute %s? [Yes, No, Skip] ", line);
-        free(line);
+        r = ask_char(response, "yns", "Execute %s? [Yes, No, Skip] ", line);
 
         restore_confirm_stdio(&saved_stdin, &saved_stdout);
 
@@ -1173,7 +1172,7 @@ static int build_environment(
                         return -ENOMEM;
                 our_env[n_env++] = x;
 
-                if (asprintf(&x, "WATCHDOG_USEC=%llu", (unsigned long long) watchdog_usec) < 0)
+                if (asprintf(&x, "WATCHDOG_USEC="USEC_FMT, watchdog_usec) < 0)
                         return -ENOMEM;
                 our_env[n_env++] = x;
         }
@@ -1569,7 +1568,9 @@ int exec_spawn(ExecCommand *command,
                     !strv_isempty(context->inaccessible_dirs) ||
                     context->mount_flags != 0 ||
                     (context->private_tmp && runtime && (runtime->tmp_dir || runtime->var_tmp_dir)) ||
-                    context->private_devices) {
+                    context->private_devices ||
+                    context->protect_system != PROTECT_SYSTEM_NO ||
+                    context->protect_home != PROTECT_HOME_NO) {
 
                         char *tmp = NULL, *var = NULL;
 
@@ -1593,8 +1594,9 @@ int exec_spawn(ExecCommand *command,
                                         tmp,
                                         var,
                                         context->private_devices,
+                                        context->protect_home,
+                                        context->protect_system,
                                         context->mount_flags);
-
                         if (err < 0) {
                                 r = EXIT_NAMESPACE;
                                 goto fail_child;
@@ -2021,7 +2023,7 @@ int exec_context_load_environment(const ExecContext *c, char ***l) {
                         return -EINVAL;
                 }
                 for (n = 0; n < count; n++) {
-                        k = load_env_file(pglob.gl_pathv[n], NULL, &p);
+                        k = load_env_file(NULL, pglob.gl_pathv[n], NULL, &p);
                         if (k < 0) {
                                 if (ignore)
                                         continue;
@@ -2055,8 +2057,8 @@ int exec_context_load_environment(const ExecContext *c, char ***l) {
 }
 
 static bool tty_may_match_dev_console(const char *tty) {
-        char *active = NULL, *console;
-        bool b;
+        _cleanup_free_ char *active = NULL;
+       char *console;
 
         if (startswith(tty, "/dev/"))
                 tty += 5;
@@ -2071,10 +2073,7 @@ static bool tty_may_match_dev_console(const char *tty) {
                 return true;
 
         /* "tty0" means the active VC, so it may be the same sometimes */
-        b = streq(console, tty) || (streq(console, "tty0") && tty_is_vc(tty));
-        free(active);
-
-        return b;
+        return streq(console, tty) || (streq(console, "tty0") && tty_is_vc(tty));
 }
 
 bool exec_context_may_touch_console(ExecContext *ec) {
@@ -2111,6 +2110,8 @@ void exec_context_dump(ExecContext *c, FILE* f, const char *prefix) {
                 "%sPrivateTmp: %s\n"
                 "%sPrivateNetwork: %s\n"
                 "%sPrivateDevices: %s\n"
+                "%sProtectHome: %s\n"
+                "%sProtectSystem: %s\n"
                 "%sIgnoreSIGPIPE: %s\n",
                 prefix, c->umask,
                 prefix, c->working_directory ? c->working_directory : "/",
@@ -2119,6 +2120,8 @@ void exec_context_dump(ExecContext *c, FILE* f, const char *prefix) {
                 prefix, yes_no(c->private_tmp),
                 prefix, yes_no(c->private_network),
                 prefix, yes_no(c->private_devices),
+                prefix, protect_home_to_string(c->protect_home),
+                prefix, protect_system_to_string(c->protect_system),
                 prefix, yes_no(c->ignore_sigpipe));
 
         STRV_FOREACH(e, c->environment)
@@ -2139,7 +2142,8 @@ void exec_context_dump(ExecContext *c, FILE* f, const char *prefix) {
 
         for (i = 0; i < RLIM_NLIMITS; i++)
                 if (c->rlimit[i])
-                        fprintf(f, "%s%s: %llu\n", prefix, rlimit_to_string(i), (unsigned long long) c->rlimit[i]->rlim_max);
+                        fprintf(f, "%s%s: "RLIM_FMT"\n",
+                                prefix, rlimit_to_string(i), c->rlimit[i]->rlim_max);
 
         if (c->ioprio_set) {
                 _cleanup_free_ char *class_str = NULL;
@@ -2459,10 +2463,10 @@ char *exec_command_line(char **argv) {
 }
 
 void exec_command_dump(ExecCommand *c, FILE *f, const char *prefix) {
-        char *p2;
+        _cleanup_free_ char *p2 = NULL;
         const char *prefix2;
 
-        char *cmd;
+        _cleanup_free_ char *cmd = NULL;
 
         assert(c);
         assert(f);
@@ -2478,11 +2482,7 @@ void exec_command_dump(ExecCommand *c, FILE *f, const char *prefix) {
                 "%sCommand Line: %s\n",
                 prefix, cmd ? cmd : strerror(ENOMEM));
 
-        free(cmd);
-
         exec_status_dump(&c->exec_status, f, prefix2);
-
-        free(p2);
 }
 
 void exec_command_dump_list(ExecCommand *c, FILE *f, const char *prefix) {

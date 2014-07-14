@@ -38,6 +38,7 @@
 #include "bus-error.h"
 #include "bus-message.h"
 #include "event-util.h"
+#include "locale-util.h"
 
 enum {
         /* We don't list LC_ALL here on purpose. People should be
@@ -288,7 +289,7 @@ static int locale_write_data(Context *c) {
         int r, p;
         char **l = NULL;
 
-        r = load_env_file("/etc/locale.conf", NULL, &l);
+        r = load_env_file(NULL, "/etc/locale.conf", NULL, &l);
         if (r < 0 && r != -ENOENT)
                 return r;
 
@@ -393,7 +394,7 @@ static int vconsole_write_data(Context *c) {
         int r;
         _cleanup_strv_free_ char **l = NULL;
 
-        r = load_env_file("/etc/vconsole.conf", NULL, &l);
+        r = load_env_file(NULL, "/etc/vconsole.conf", NULL, &l);
         if (r < 0 && r != -ENOENT)
                 return r;
 
@@ -712,15 +713,16 @@ static int find_legacy_keymap(Context *c, char **new_keymap) {
                         }
                 }
 
-                if (matching > 0 &&
-                    streq_ptr(c->x11_model, a[2])) {
-                        matching++;
-
-                        if (streq_ptr(c->x11_variant, a[3])) {
+                if (matching > 0) {
+                        if (isempty(c->x11_model) || streq_ptr(c->x11_model, a[2])) {
                                 matching++;
 
-                                if (streq_ptr(c->x11_options, a[4]))
+                                if (streq_ptr(c->x11_variant, a[3])) {
                                         matching++;
+
+                                        if (streq_ptr(c->x11_options, a[4]))
+                                                matching++;
+                                }
                         }
                 }
 
@@ -847,7 +849,7 @@ static int method_set_locale(sd_bus *bus, sd_bus_message *m, void *userdata, sd_
                         k = strlen(names[p]);
                         if (startswith(*i, names[p]) &&
                             (*i)[k] == '=' &&
-                            string_is_safe((*i) + k + 1)) {
+                            locale_is_valid((*i) + k + 1)) {
                                 valid = true;
                                 passed[p] = true;
 
@@ -1088,7 +1090,7 @@ static int connect_bus(Context *c, sd_event *event, sd_bus **_bus) {
                 return r;
         }
 
-        r = sd_bus_add_object_vtable(bus, "/org/freedesktop/locale1", "org.freedesktop.locale1", locale_vtable, c);
+        r = sd_bus_add_object_vtable(bus, NULL, "/org/freedesktop/locale1", "org.freedesktop.locale1", locale_vtable, c);
         if (r < 0) {
                 log_error("Failed to register object: %s", strerror(-r));
                 return r;

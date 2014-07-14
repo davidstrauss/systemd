@@ -24,7 +24,6 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <sys/un.h>
-#include <net/if.h>
 #include <asm/types.h>
 #include <linux/netlink.h>
 #include <linux/if_packet.h>
@@ -70,6 +69,7 @@ int socket_address_parse(SocketAddress *a, const char *s);
 int socket_address_parse_netlink(SocketAddress *a, const char *s);
 int socket_address_print(const SocketAddress *a, char **p);
 int socket_address_verify(const SocketAddress *a) _pure_;
+int socket_address_unlink(SocketAddress *a);
 
 bool socket_address_can_accept(const SocketAddress *a) _pure_;
 

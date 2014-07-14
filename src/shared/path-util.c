@@ -132,6 +132,91 @@ char *path_make_absolute_cwd(const char *p) {
         return path_make_absolute(p, cwd);
 }
 
+int path_make_relative(const char *from_dir, const char *to_path, char **_r) {
+        char *r, *p;
+        unsigned n_parents;
+
+        assert(from_dir);
+        assert(to_path);
+        assert(_r);
+
+        /* Strips the common part, and adds ".." elements as necessary. */
+
+        if (!path_is_absolute(from_dir))
+                return -EINVAL;
+
+        if (!path_is_absolute(to_path))
+                return -EINVAL;
+
+        /* Skip the common part. */
+        for (;;) {
+                size_t a;
+                size_t b;
+
+                from_dir += strspn(from_dir, "/");
+                to_path += strspn(to_path, "/");
+
+                if (!*from_dir) {
+                        if (!*to_path)
+                                /* from_dir equals to_path. */
+                                r = strdup(".");
+                        else
+                                /* from_dir is a parent directory of to_path. */
+                                r = strdup(to_path);
+
+                        if (!r)
+                                return -ENOMEM;
+
+                        path_kill_slashes(r);
+
+                        *_r = r;
+                        return 0;
+                }
+
+                if (!*to_path)
+                        break;
+
+                a = strcspn(from_dir, "/");
+                b = strcspn(to_path, "/");
+
+                if (a != b)
+                        break;
+
+                if (memcmp(from_dir, to_path, a) != 0)
+                        break;
+
+                from_dir += a;
+                to_path += b;
+        }
+
+        /* If we're here, then "from_dir" has one or more elements that need to
+         * be replaced with "..". */
+
+        /* Count the number of necessary ".." elements. */
+        for (n_parents = 0;;) {
+                from_dir += strspn(from_dir, "/");
+
+                if (!*from_dir)
+                        break;
+
+                from_dir += strcspn(from_dir, "/");
+                n_parents++;
+        }
+
+        r = malloc(n_parents * 3 + strlen(to_path) + 1);
+        if (!r)
+                return -ENOMEM;
+
+        for (p = r; n_parents > 0; n_parents--, p += 3)
+                memcpy(p, "../", 3);
+
+        strcpy(p, to_path);
+        path_kill_slashes(r);
+
+        *_r = r;
+        return 0;
+}
+
 char **path_strv_make_absolute_cwd(char **l) {
         char **s;
 
@@ -153,7 +238,7 @@ char **path_strv_make_absolute_cwd(char **l) {
         return l;
 }
 
-char **path_strv_canonicalize_absolute(char **l, const char *prefix) {
+char **path_strv_resolve(char **l, const char *prefix) {
         char **s;
         unsigned k = 0;
         bool enomem = false;
@@ -167,35 +252,62 @@ char **path_strv_canonicalize_absolute(char **l, const char *prefix) {
 
         STRV_FOREACH(s, l) {
                 char *t, *u;
+                _cleanup_free_ char *orig = NULL;
 
-                if (!path_is_absolute(*s))
+                if (!path_is_absolute(*s)) {
+                        free(*s);
                         continue;
+                }
 
                 if (prefix) {
-                        t = strappend(prefix, *s);
-                        free(*s);
-                        *s = NULL;
-
+                        orig = *s;
+                        t = strappend(prefix, orig);
                         if (!t) {
                                 enomem = true;
                                 continue;
                         }
-                } else {
+                } else
                         t = *s;
-                        *s = NULL;
-                }
 
                 errno = 0;
                 u = canonicalize_file_name(t);
                 if (!u) {
-                        if (errno == ENOENT)
-                                u = t;
-                        else {
+                        if (errno == ENOENT) {
+                                if (prefix) {
+                                        u = orig;
+                                        orig = NULL;
+                                        free(t);
+                                } else
+                                        u = t;
+                        } else {
                                 free(t);
                                 if (errno == ENOMEM || errno == 0)
                                         enomem = true;
 
                                 continue;
+                        }
+                } else if (prefix) {
+                        char *x;
+
+                        free(t);
+                        x = path_startswith(u, prefix);
+                        if (x) {
+                                /* restore the slash if it was lost */
+                                if (!startswith(x, "/"))
+                                        *(--x) = '/';
+
+                                t = strdup(x);
+                                free(u);
+                                if (!t) {
+                                        enomem = true;
+                                        continue;
+                                }
+                                u = t;
+                        } else {
+                                /* canonicalized path goes outside of
+                                 * prefix, keep the original path instead */
+                                u = orig;
+                                orig = NULL;
                         }
                 } else
                         free(t);
@@ -211,12 +323,12 @@ char **path_strv_canonicalize_absolute(char **l, const char *prefix) {
         return l;
 }
 
-char **path_strv_canonicalize_absolute_uniq(char **l, const char *prefix) {
+char **path_strv_resolve_uniq(char **l, const char *prefix) {
 
         if (strv_isempty(l))
                 return l;
 
-        if (!path_strv_canonicalize_absolute(l, prefix))
+        if (!path_strv_resolve(l, prefix))
                 return NULL;
 
         return strv_uniq(l);
@@ -330,7 +442,7 @@ int path_is_mount_point(const char *t, bool allow_symlink) {
         };
 
         int mount_id, mount_id_parent;
-        char *parent;
+        _cleanup_free_ char *parent = NULL;
         struct stat a, b;
         int r;
 
@@ -361,7 +473,6 @@ int path_is_mount_point(const char *t, bool allow_symlink) {
 
         h.handle.handle_bytes = MAX_HANDLE_SZ;
         r = name_to_handle_at(AT_FDCWD, parent, &h.handle, &mount_id_parent, 0);
-        free(parent);
         if (r < 0) {
                 /* The parent can't do name_to_handle_at() but the
                  * directory we are interested in can? If so, it must
@@ -392,7 +503,6 @@ fallback:
                 return r;
 
         r = lstat(parent, &b);
-        free(parent);
         if (r < 0)
                 return -errno;
 
@@ -414,18 +524,24 @@ int path_is_os_tree(const char *path) {
         char *p;
         int r;
 
-        /* We use /etc/os-release as flag file if something is an OS */
+        /* We use /usr/lib/os-release as flag file if something is an OS */
+        p = strappenda(path, "/usr/lib/os-release");
+        r = access(p, F_OK);
 
+        if (r >= 0)
+                return 1;
+
+        /* Also check for the old location in /etc, just in case. */
         p = strappenda(path, "/etc/os-release");
         r = access(p, F_OK);
 
-        return r < 0 ? 0 : 1;
+        return r >= 0;
 }
 
 int find_binary(const char *name, char **filename) {
         assert(name);
 
-        if (strchr(name, '/')) {
+        if (is_path(name)) {
                 if (access(name, X_OK) < 0)
                         return -errno;
 
@@ -510,8 +626,25 @@ bool paths_check_timestamp(const char* const* paths, usec_t *timestamp, bool upd
 }
 
 int fsck_exists(const char *fstype) {
+        _cleanup_free_ char *p = NULL, *d = NULL;
         const char *checker;
+        int r;
 
         checker = strappenda("fsck.", fstype);
-        return find_binary(checker, NULL);
+
+        r = find_binary(checker, &p);
+        if (r < 0)
+                return r;
+
+        /* An fsck that is linked to /bin/true is a non-existent
+         * fsck */
+
+        r = readlink_malloc(p, &d);
+        if (r >= 0 &&
+            (path_equal(d, "/bin/true") ||
+             path_equal(d, "/usr/bin/true") ||
+             path_equal(d, "/dev/null")))
+                return -ENOENT;
+
+        return 0;
 }

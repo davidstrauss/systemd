@@ -43,7 +43,9 @@ static int name_owner_change_callback(sd_bus *bus, sd_bus_message *m, void *user
         assert(m);
         assert(e);
 
+        sd_bus_close(bus);
         sd_event_exit(e, 0);
+
         return 1;
 }
 
@@ -77,7 +79,7 @@ int bus_async_unregister_and_exit(sd_event *e, sd_bus *bus, const char *name) {
         if (r < 0)
                 return -ENOMEM;
 
-        r = sd_bus_add_match(bus, match, name_owner_change_callback, e);
+        r = sd_bus_add_match(bus, NULL, match, name_owner_change_callback, e);
         if (r < 0)
                 return r;
 
@@ -121,11 +123,30 @@ int bus_event_loop_with_idle(
                         return r;
 
                 if (r == 0 && !exiting) {
-                        r = bus_async_unregister_and_exit(e, bus, name);
+
+                        r = sd_bus_try_close(bus);
+                        if (r == -EBUSY)
+                                continue;
+
+                        if (r == -ENOTSUP) {
+                                /* Fallback for dbus1 connections: we
+                                 * unregister the name and wait for
+                                 * the response to come through for
+                                 * it */
+
+                                r = bus_async_unregister_and_exit(e, bus, name);
+                                if (r < 0)
+                                        return r;
+
+                                exiting = true;
+                                continue;
+                        }
+
                         if (r < 0)
                                 return r;
 
-                        exiting = true;
+                        sd_event_exit(e, 0);
+                        break;
                 }
         }
 
@@ -251,17 +272,16 @@ typedef struct AsyncPolkitQuery {
         sd_bus_message *request, *reply;
         sd_bus_message_handler_t callback;
         void *userdata;
-        uint64_t serial;
+        sd_bus_slot *slot;
         Hashmap *registry;
 } AsyncPolkitQuery;
 
-static void async_polkit_query_free(sd_bus *b, AsyncPolkitQuery *q) {
+static void async_polkit_query_free(AsyncPolkitQuery *q) {
 
         if (!q)
                 return;
 
-        if (q->serial > 0 && b)
-                sd_bus_call_async_cancel(b, q->serial);
+        sd_bus_slot_unref(q->slot);
 
         if (q->registry && q->request)
                 hashmap_remove(q->registry, q->request);
@@ -281,8 +301,8 @@ static int async_polkit_callback(sd_bus *bus, sd_bus_message *reply, void *userd
         assert(reply);
         assert(q);
 
+        q->slot = sd_bus_slot_unref(q->slot);
         q->reply = sd_bus_message_ref(reply);
-        q->serial = 0;
 
         r = sd_bus_message_rewind(q->request, true);
         if (r < 0) {
@@ -294,7 +314,8 @@ static int async_polkit_callback(sd_bus *bus, sd_bus_message *reply, void *userd
         r = bus_maybe_reply_error(q->request, r, &error_buffer);
 
 finish:
-        async_polkit_query_free(bus, q);
+        async_polkit_query_free(q);
+
         return r;
 }
 
@@ -413,15 +434,15 @@ int bus_verify_polkit_async(
 
         r = hashmap_put(*registry, m, q);
         if (r < 0) {
-                async_polkit_query_free(bus, q);
+                async_polkit_query_free(q);
                 return r;
         }
 
         q->registry = *registry;
 
-        r = sd_bus_call_async(bus, pk, async_polkit_callback, q, 0, &q->serial);
+        r = sd_bus_call_async(bus, &q->slot, pk, async_polkit_callback, q, 0);
         if (r < 0) {
-                async_polkit_query_free(bus, q);
+                async_polkit_query_free(q);
                 return r;
         }
 
@@ -436,7 +457,7 @@ void bus_verify_polkit_async_registry_free(sd_bus *bus, Hashmap *registry) {
         AsyncPolkitQuery *q;
 
         while ((q = hashmap_steal_first(registry)))
-                async_polkit_query_free(bus, q);
+                async_polkit_query_free(q);
 
         hashmap_free(registry);
 #endif
@@ -537,7 +558,7 @@ int bus_open_user_systemd(sd_bus **_bus) {
         if (r < 0)
                 return r;
 
-        if (asprintf(&bus->address, KERNEL_USER_BUS_FMT, (unsigned long) getuid()) < 0)
+        if (asprintf(&bus->address, KERNEL_USER_BUS_FMT, getuid()) < 0)
                 return -ENOMEM;
 
         bus->bus_client = true;
@@ -1104,20 +1125,6 @@ int bus_open_transport_systemd(BusTransport transport, const char *host, bool us
         return r;
 }
 
-int bus_property_get_tristate(
-                sd_bus *bus,
-                const char *path,
-                const char *interface,
-                const char *property,
-                sd_bus_message *reply,
-                void *userdata,
-                sd_bus_error *error) {
-
-        int *tristate = userdata;
-
-        return sd_bus_message_append(reply, "b", *tristate > 0);
-}
-
 int bus_property_get_bool(
                 sd_bus *bus,
                 const char *path,
@@ -1274,40 +1281,10 @@ int bus_append_unit_property_assignment(sd_bus_message *m, const char *assignmen
 
                         r = sd_bus_message_append(m, "v", "t", (usec_t) percent * USEC_PER_SEC / 100);
                 } else {
-                        usec_t us;
-
-                        r = parse_sec(eq, &us);
-                        if (r < 0) {
-                                log_error("CPU quota '%s' invalid.", eq);
-                                return -EINVAL;
-                        }
-
-                        r = sd_bus_message_append_basic(m, SD_BUS_TYPE_STRING, "CPUQuotaUSec");
-                        if (r < 0)
-                                return bus_log_create_error(r);
-
-                        r = sd_bus_message_append(m, "v", "t", us);
-                }
-
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                return 0;
-
-        } else if (streq(field, "CPUQuotaPeriodSec")) {
-                usec_t us;
-
-                r = parse_sec(eq, &us);
-                if (r < 0) {
-                        log_error("CPU period '%s' invalid.", eq);
+                        log_error("CPU quota needs to be in percent.");
                         return -EINVAL;
                 }
 
-                r = sd_bus_message_append_basic(m, SD_BUS_TYPE_STRING, "CPUQuotaPeriodUSec");
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_message_append(m, "v", "t", us);
                 if (r < 0)
                         return bus_log_create_error(r);
 

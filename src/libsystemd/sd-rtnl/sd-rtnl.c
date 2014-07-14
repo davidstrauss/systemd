@@ -22,6 +22,7 @@
 #include <sys/socket.h>
 #include <poll.h>
 
+#include "missing.h"
 #include "macro.h"
 #include "util.h"
 #include "hashmap.h"
@@ -75,8 +76,27 @@ static bool rtnl_pid_changed(sd_rtnl *rtnl) {
         return rtnl->original_pid != getpid();
 }
 
-int sd_rtnl_open(sd_rtnl **ret, uint32_t groups) {
+static int rtnl_compute_groups_ap(uint32_t *_groups, unsigned n_groups, va_list ap) {
+        uint32_t groups = 0;
+        unsigned i;
+
+        for (i = 0; i < n_groups; i++) {
+                unsigned group;
+
+                group = va_arg(ap, unsigned);
+                assert_return(group < 32, -EINVAL);
+
+                groups |= group ? (1 << (group - 1)) : 0;
+        }
+
+        *_groups = groups;
+
+        return 0;
+}
+
+int sd_rtnl_open(sd_rtnl **ret, unsigned n_groups, ...) {
         _cleanup_rtnl_unref_ sd_rtnl *rtnl = NULL;
+        va_list ap;
         socklen_t addrlen;
         int r, one = 1;
 
@@ -90,10 +110,19 @@ int sd_rtnl_open(sd_rtnl **ret, uint32_t groups) {
         if (rtnl->fd < 0)
                 return -errno;
 
-        if (setsockopt(rtnl->fd, SOL_SOCKET, SO_PASSCRED, &one, sizeof(one)) < 0)
+        r = setsockopt(rtnl->fd, SOL_SOCKET, SO_PASSCRED, &one, sizeof(one));
+        if (r < 0)
                 return -errno;
 
-        rtnl->sockaddr.nl.nl_groups = groups;
+        r = setsockopt(rtnl->fd, SOL_NETLINK, NETLINK_PKTINFO, &one, sizeof(one));
+        if (r < 0)
+                return -errno;
+
+        va_start(ap, n_groups);
+        r = rtnl_compute_groups_ap(&rtnl->sockaddr.nl.nl_groups, n_groups, ap);
+        va_end(ap);
+        if (r < 0)
+                return r;
 
         addrlen = sizeof(rtnl->sockaddr);
 

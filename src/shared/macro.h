@@ -63,6 +63,10 @@
         _Pragma("GCC diagnostic push");                                 \
         _Pragma("GCC diagnostic ignored \"-Wnonnull\"")
 
+#define DISABLE_WARNING_SHADOW                                          \
+        _Pragma("GCC diagnostic push");                                 \
+        _Pragma("GCC diagnostic ignored \"-Wshadow\"")
+
 #define REENABLE_WARNING                                                \
         _Pragma("GCC diagnostic pop")
 
@@ -100,6 +104,19 @@ static inline size_t ALIGN_TO(size_t l, size_t ali) {
 
 #define ALIGN_TO_PTR(p, ali) ((void*) ALIGN_TO((unsigned long) p, ali))
 
+/* align to next higher power-of-2 (except for: 0 => 0, overflow => 0) */
+static inline unsigned long ALIGN_POWER2(unsigned long u) {
+        /* clz(0) is undefined */
+        if (u == 1)
+                return 1;
+
+        /* left-shift overflow is undefined */
+        if (__builtin_clzl(u - 1UL) < 1)
+                return 0;
+
+        return 1UL << (sizeof(u) * 8 - __builtin_clzl(u - 1UL));
+}
+
 #define ELEMENTSOF(x) (sizeof(x)/sizeof((x)[0]))
 
 /*
@@ -135,6 +152,12 @@ static inline size_t ALIGN_TO(size_t l, size_t ali) {
                         typeof(a) _a = (a);     \
                         typeof(b) _b = (b);     \
                         _a < _b ? _a : _b;      \
+                })
+
+#define MIN3(x,y,z)                              \
+        __extension__ ({                         \
+                        typeof(x) _c = MIN(x,y); \
+                        MIN(_c, z);              \
                 })
 
 #define LESS_BY(A,B)                            \

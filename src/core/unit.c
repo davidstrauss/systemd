@@ -51,6 +51,7 @@
 #include "dbus.h"
 #include "execute.h"
 #include "virt.h"
+#include "dropin.h"
 
 const UnitVTable * const unit_vtable[_UNIT_TYPE_MAX] = {
         [UNIT_SERVICE] = &service_vtable,
@@ -121,7 +122,6 @@ static void unit_init(Unit *u) {
                 cc->cpu_accounting = u->manager->default_cpu_accounting;
                 cc->blockio_accounting = u->manager->default_blockio_accounting;
                 cc->memory_accounting = u->manager->default_memory_accounting;
-                cc->cpu_quota_period_usec = u->manager->default_cpu_quota_period_usec;
         }
 
         ec = unit_get_exec_context(u);
@@ -509,6 +509,7 @@ void unit_free(Unit *u) {
         }
 
         set_remove(u->manager->failed_units, u);
+        set_remove(u->manager->startup_units, u);
 
         free(u->description);
         strv_free(u->documentation);
@@ -1071,6 +1072,25 @@ static int unit_add_mount_dependencies(Unit *u) {
         return 0;
 }
 
+static int unit_add_startup_units(Unit *u) {
+        CGroupContext *c;
+        int r = 0;
+
+        c = unit_get_cgroup_context(u);
+        if (!c)
+                return 0;
+
+        if (c->startup_cpu_shares == (unsigned long) -1 &&
+            c->startup_blockio_weight == (unsigned long) -1)
+                return 0;
+
+        r = set_put(u->manager->startup_units, u);
+        if (r == -EEXIST)
+                return 0;
+
+        return r;
+}
+
 int unit_load(Unit *u) {
         int r;
 
@@ -1109,6 +1129,10 @@ int unit_load(Unit *u) {
                         goto fail;
 
                 r = unit_add_mount_dependencies(u);
+                if (r < 0)
+                        goto fail;
+
+                r = unit_add_startup_units(u);
                 if (r < 0)
                         goto fail;
 
@@ -1551,7 +1575,7 @@ void unit_notify(Unit *u, UnitActiveState os, UnitActiveState ns, bool reload_su
 
         /* Note that this is called for all low-level state changes,
          * even if they might map to the same high-level
-         * UnitActiveState! That means that ns == os is OK an expected
+         * UnitActiveState! That means that ns == os is an expected
          * behavior here. For example: if a mount point is remounted
          * this function will be called too! */
 
@@ -1574,7 +1598,7 @@ void unit_notify(Unit *u, UnitActiveState os, UnitActiveState ns, bool reload_su
                         u->active_exit_timestamp = ts;
         }
 
-        /* Keep track of failed of units */
+        /* Keep track of failed units */
         if (ns == UNIT_FAILED && os != UNIT_FAILED)
                 set_put(u->manager->failed_units, u);
         else if (os == UNIT_FAILED && ns != UNIT_FAILED)
@@ -1699,7 +1723,7 @@ void unit_notify(Unit *u, UnitActiveState os, UnitActiveState ns, bool reload_su
         if (UNIT_IS_ACTIVE_OR_RELOADING(ns)) {
 
                 if (unit_has_name(u, SPECIAL_DBUS_SERVICE))
-                        /* The bus just might have become available,
+                        /* The bus might have just become available,
                          * hence try to connect to it, if we aren't
                          * yet connected. */
                         bus_init(m, true);
@@ -2288,25 +2312,25 @@ bool unit_can_serialize(Unit *u) {
 }
 
 int unit_serialize(Unit *u, FILE *f, FDSet *fds, bool serialize_jobs) {
-        ExecRuntime *rt;
         int r;
 
         assert(u);
         assert(f);
         assert(fds);
 
-        if (!unit_can_serialize(u))
-                return 0;
+        if (unit_can_serialize(u)) {
+                ExecRuntime *rt;
 
-        r = UNIT_VTABLE(u)->serialize(u, f, fds);
-        if (r < 0)
-                return r;
-
-        rt = unit_get_exec_runtime(u);
-        if (rt) {
-                r = exec_runtime_serialize(rt, u, f, fds);
+                r = UNIT_VTABLE(u)->serialize(u, f, fds);
                 if (r < 0)
                         return r;
+
+                rt = unit_get_exec_runtime(u);
+                if (rt) {
+                        r = exec_runtime_serialize(rt, u, f, fds);
+                        if (r < 0)
+                                return r;
+                }
         }
 
         dual_timestamp_serialize(f, "inactive-exit-timestamp", &u->inactive_exit_timestamp);
@@ -2368,16 +2392,13 @@ void unit_serialize_item(Unit *u, FILE *f, const char *key, const char *value) {
 }
 
 int unit_deserialize(Unit *u, FILE *f, FDSet *fds) {
-        size_t offset;
         ExecRuntime **rt = NULL;
+        size_t offset;
         int r;
 
         assert(u);
         assert(f);
         assert(fds);
-
-        if (!unit_can_serialize(u))
-                return 0;
 
         offset = UNIT_VTABLE(u)->exec_runtime_offset;
         if (offset > 0)
@@ -2488,24 +2509,34 @@ int unit_deserialize(Unit *u, FILE *f, FDSet *fds) {
                         if (!s)
                                 return -ENOMEM;
 
-                        free(u->cgroup_path);
-                        u->cgroup_path = s;
+                        if (u->cgroup_path) {
+                                void *p;
 
+                                p = hashmap_remove(u->manager->cgroup_unit, u->cgroup_path);
+                                log_info("Removing cgroup_path %s from hashmap (%p)",
+                                         u->cgroup_path, p);
+                                free(u->cgroup_path);
+                        }
+
+                        u->cgroup_path = s;
                         assert(hashmap_put(u->manager->cgroup_unit, s, u) == 1);
+
                         continue;
                 }
 
-                if (rt) {
-                        r = exec_runtime_deserialize_item(rt, u, l, v, fds);
+                if (unit_can_serialize(u)) {
+                        if (rt) {
+                                r = exec_runtime_deserialize_item(rt, u, l, v, fds);
+                                if (r < 0)
+                                        return r;
+                                if (r > 0)
+                                        continue;
+                        }
+
+                        r = UNIT_VTABLE(u)->deserialize_item(u, l, v, fds);
                         if (r < 0)
                                 return r;
-                        if (r > 0)
-                                continue;
                 }
-
-                r = UNIT_VTABLE(u)->deserialize_item(u, l, v, fds);
-                if (r < 0)
-                        return r;
         }
 }
 
@@ -2936,68 +2967,55 @@ ExecRuntime *unit_get_exec_runtime(Unit *u) {
         return *(ExecRuntime**) ((uint8_t*) u + offset);
 }
 
-static int drop_in_file(Unit *u, UnitSetPropertiesMode mode, const char *name, char **_p, char **_q) {
-        _cleanup_free_ char *b = NULL;
-        char *p, *q;
-        int r;
-
-        assert(u);
-        assert(name);
-        assert(_p);
-        assert(_q);
-
-        b = xescape(name, "/.");
-        if (!b)
-                return -ENOMEM;
-
-        if (!filename_is_safe(b))
-                return -EINVAL;
-
+static int unit_drop_in_dir(Unit *u, UnitSetPropertiesMode mode, bool transient, char **dir) {
         if (u->manager->running_as == SYSTEMD_USER) {
-                _cleanup_free_ char *c = NULL;
+                int r;
 
-                r = user_config_home(&c);
-                if (r < 0)
-                        return r;
+                r = user_config_home(dir);
                 if (r == 0)
                         return -ENOENT;
-
-                p = strjoin(c, "/", u->id, ".d", NULL);
-        } else if (mode == UNIT_PERSISTENT && !u->transient)
-                p = strjoin("/etc/systemd/system/", u->id, ".d", NULL);
-        else
-                p = strjoin("/run/systemd/system/", u->id, ".d", NULL);
-        if (!p)
-                return -ENOMEM;
-
-        q = strjoin(p, "/90-", b, ".conf", NULL);
-        if (!q) {
-                free(p);
-                return -ENOMEM;
+                return r;
         }
 
-        *_p = p;
-        *_q = q;
+        if (mode == UNIT_PERSISTENT && !transient)
+                *dir = strdup("/etc/systemd/system");
+        else
+                *dir = strdup("/run/systemd/system");
+        if (!*dir)
+                return -ENOMEM;
+
         return 0;
 }
 
-int unit_write_drop_in(Unit *u, UnitSetPropertiesMode mode, const char *name, const char *data) {
-        _cleanup_free_ char *p = NULL, *q = NULL;
+static int unit_drop_in_file(Unit *u,
+                             UnitSetPropertiesMode mode, const char *name, char **p, char **q) {
+        _cleanup_free_ char *dir = NULL;
         int r;
 
         assert(u);
-        assert(name);
-        assert(data);
+
+        r = unit_drop_in_dir(u, mode, u->transient, &dir);
+        if (r < 0)
+                return r;
+
+        return drop_in_file(dir, u->id, 50, name, p, q);
+}
+
+int unit_write_drop_in(Unit *u, UnitSetPropertiesMode mode, const char *name, const char *data) {
+
+        _cleanup_free_ char *dir = NULL;
+        int r;
+
+        assert(u);
 
         if (!IN_SET(mode, UNIT_PERSISTENT, UNIT_RUNTIME))
                 return 0;
 
-        r = drop_in_file(u, mode, name, &p, &q);
+        r = unit_drop_in_dir(u, mode, u->transient, &dir);
         if (r < 0)
                 return r;
 
-        mkdir_p(p, 0755);
-        return write_string_file_atomic_label(q, data);
+        return write_drop_in(dir, u->id, 50, name, data);
 }
 
 int unit_write_drop_in_format(Unit *u, UnitSetPropertiesMode mode, const char *name, const char *format, ...) {
@@ -3073,7 +3091,7 @@ int unit_remove_drop_in(Unit *u, UnitSetPropertiesMode mode, const char *name) {
         if (!IN_SET(mode, UNIT_PERSISTENT, UNIT_RUNTIME))
                 return 0;
 
-        r = drop_in_file(u, mode, name, &p, &q);
+        r = unit_drop_in_file(u, mode, name, &p, &q);
         if (r < 0)
                 return r;
 

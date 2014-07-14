@@ -103,7 +103,7 @@
                                 directory path. Sets the root
                                 directory for executed processes, with
                                 the
-                                <citerefentry><refentrytitle>chroot</refentrytitle><manvolnum>2</manvolnum></citerefentry>
+                                <citerefentry project='man-pages'><refentrytitle>chroot</refentrytitle><manvolnum>2</manvolnum></citerefentry>
                                 system call. If this is used, it must
                                 be ensured that the process and all
                                 its auxiliary files are available in
@@ -304,7 +304,7 @@
 
                                 <para>
                                 See
-                                <citerefentry><refentrytitle>environ</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+                                <citerefentry project='man-pages'><refentrytitle>environ</refentrytitle><manvolnum>7</manvolnum></citerefentry>
                                 for details about environment variables.</para></listitem>
                         </varlistentry>
                         <varlistentry>
@@ -341,7 +341,7 @@
                                 <para>The files listed with this
                                 directive will be read shortly before
                                 the process is executed (more
-                                specifically, this means after all
+                                specifically, after all
                                 processes from a previous unit state
                                 terminated. This means you can
                                 generate these files in one unit
@@ -443,12 +443,12 @@
                                 for other processes to release the
                                 terminal. <option>syslog</option>
                                 connects standard output to the
-                                <citerefentry><refentrytitle>syslog</refentrytitle><manvolnum>3</manvolnum></citerefentry>
+                                <citerefentry project='man-pages'><refentrytitle>syslog</refentrytitle><manvolnum>3</manvolnum></citerefentry>
                                 system syslog
                                 service. <option>kmsg</option>
                                 connects it with the kernel log buffer
                                 which is accessible via
-                                <citerefentry><refentrytitle>dmesg</refentrytitle><manvolnum>1</manvolnum></citerefentry>. <option>journal</option>
+                                <citerefentry project='man-pages'><refentrytitle>dmesg</refentrytitle><manvolnum>1</manvolnum></citerefentry>. <option>journal</option>
                                 connects it with the journal which is
                                 accessible via
                                 <citerefentry><refentrytitle>journalctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>
@@ -568,7 +568,7 @@
                                 <option>local5</option>,
                                 <option>local6</option> or
                                 <option>local7</option>. See
-                                <citerefentry><refentrytitle>syslog</refentrytitle><manvolnum>3</manvolnum></citerefentry>
+                                <citerefentry project='man-pages'><refentrytitle>syslog</refentrytitle><manvolnum>3</manvolnum></citerefentry>
                                 for details. This option is only
                                 useful when
                                 <varname>StandardOutput=</varname> or
@@ -590,7 +590,7 @@
                                 <option>notice</option>,
                                 <option>info</option>,
                                 <option>debug</option>. See
-                                <citerefentry><refentrytitle>syslog</refentrytitle><manvolnum>3</manvolnum></citerefentry>
+                                <citerefentry project='man-pages'><refentrytitle>syslog</refentrytitle><manvolnum>3</manvolnum></citerefentry>
                                 for details. This option is only
                                 useful when
                                 <varname>StandardOutput=</varname> or
@@ -687,7 +687,7 @@
                                 <varname>User=</varname> setting. If
                                 not set, no PAM session will be opened
                                 for the executed processes. See
-                                <citerefentry><refentrytitle>pam</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+                                <citerefentry project='man-pages'><refentrytitle>pam</refentrytitle><manvolnum>8</manvolnum></citerefentry>
                                 for details.</para></listitem>
                         </varlistentry>
 
@@ -698,7 +698,7 @@
                                 capabilities to include in the
                                 capability bounding set for the
                                 executed process. See
-                                <citerefentry><refentrytitle>capabilities</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+                                <citerefentry project='man-pages'><refentrytitle>capabilities</refentrytitle><manvolnum>7</manvolnum></citerefentry>
                                 for details. Takes a whitespace-separated
                                 list of capability names as read by
                                 <citerefentry><refentrytitle>cap_from_name</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
@@ -739,7 +739,7 @@
                                 <term><varname>SecureBits=</varname></term>
                                 <listitem><para>Controls the secure
                                 bits set for the executed process. See
-                                <citerefentry><refentrytitle>capabilities</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+                                <citerefentry project='man-pages'><refentrytitle>capabilities</refentrytitle><manvolnum>7</manvolnum></citerefentry>
                                 for details. Takes a list of strings:
                                 <option>keep-caps</option>,
                                 <option>keep-caps-locked</option>,
@@ -757,14 +757,14 @@
                         <varlistentry>
                                 <term><varname>Capabilities=</varname></term>
                                 <listitem><para>Controls the
-                                <citerefentry><refentrytitle>capabilities</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+                                <citerefentry project='man-pages'><refentrytitle>capabilities</refentrytitle><manvolnum>7</manvolnum></citerefentry>
                                 set for the executed process. Take a
                                 capability string describing the
                                 effective, permitted and inherited
                                 capability sets as documented in
                                 <citerefentry><refentrytitle>cap_from_text</refentrytitle><manvolnum>3</manvolnum></citerefentry>.
                                 Note that these capability sets are
-                                usually influenced by the capabilities
+                                usually influenced (and filtered) by the capabilities
                                 attached to the executed file. Due to
                                 that
                                 <varname>CapabilityBoundingSet=</varname>
@@ -777,8 +777,8 @@
                                 <term><varname>ReadOnlyDirectories=</varname></term>
                                 <term><varname>InaccessibleDirectories=</varname></term>
 
-                                <listitem><para>Sets up a new
-                                file system namespace for executed
+                                <listitem><para>Sets up a new file
+                                system namespace for executed
                                 processes. These options may be used
                                 to limit access a process might have
                                 to the main file system
@@ -799,16 +799,14 @@
                                 processes inside the namespace. Note
                                 that restricting access with these
                                 options does not extend to submounts
-                                of a directory. You must list
-                                submounts separately in these settings
-                                to ensure the same limited
-                                access. These options may be specified
+                                of a directory that are created later
+                                on. These options may be specified
                                 more than once in which case all
                                 directories listed will have limited
                                 access from within the namespace. If
                                 the empty string is assigned to this
-                                option, the specific list is reset, and
-                                all prior assignments have no
+                                option, the specific list is reset,
+                                and all prior assignments have no
                                 effect.</para>
                                 <para>Paths in
                                 <varname>ReadOnlyDirectories=</varname>
@@ -845,7 +843,7 @@
                                 processes via
                                 <filename>/tmp</filename> or
                                 <filename>/var/tmp</filename>
-                                impossible. If this is enabled all
+                                impossible. If this is enabled, all
                                 temporary files created by a service
                                 in these directories will be removed
                                 after the service is stopped. Defaults
@@ -935,6 +933,67 @@
                         </varlistentry>
 
                         <varlistentry>
+                                <term><varname>ProtectSystem=</varname></term>
+
+                                <listitem><para>Takes a boolean
+                                argument or
+                                <literal>full</literal>. If true,
+                                mounts the <filename>/usr</filename>
+                                directory read-only for processes
+                                invoked by this unit. If set to
+                                <literal>full</literal>, the
+                                <filename>/etc</filename> directory is mounted
+                                read-only, too. This setting ensures
+                                that any modification of the vendor
+                                supplied operating system (and
+                                optionally its configuration) is
+                                prohibited for the service. It is
+                                recommended to enable this setting for
+                                all long-running services, unless they
+                                are involved with system updates or
+                                need to modify the operating system in
+                                other ways. Note however that
+                                processes retaining the CAP_SYS_ADMIN
+                                capability can undo the effect of this
+                                setting. This setting is hence
+                                particularly useful for daemons which
+                                have this capability removed, for
+                                example with
+                                <varname>CapabilityBoundingSet=</varname>. Defaults
+                                to off.</para></listitem>
+                        </varlistentry>
+
+                        <varlistentry>
+                                <term><varname>ProtectHome=</varname></term>
+
+                                <listitem><para>Takes a boolean
+                                argument or
+                                <literal>read-only</literal>. If true,
+                                the directories
+                                <filename>/home</filename> and
+                                <filename>/run/user</filename> are
+                                made inaccessible and empty for
+                                processes invoked by this unit. If set
+                                to <literal>read-only</literal>, the
+                                two directores are made read-only
+                                instead. It is recommended to enable
+                                this setting for all long-running
+                                services (in particular network-facing
+                                ones), to ensure they cannot get access
+                                to private user data, unless the
+                                services actually require access to
+                                the user's private data. Note however
+                                that processes retaining the
+                                CAP_SYS_ADMIN capability can undo the
+                                effect of this setting. This setting
+                                is hence particularly useful for
+                                daemons which have this capability
+                                removed, for example with
+                                <varname>CapabilityBoundingSet=</varname>. Defaults
+                                to off.</para></listitem>
+                        </varlistentry>
+
+                        <varlistentry>
                                 <term><varname>MountFlags=</varname></term>
 
                                 <listitem><para>Takes a mount
@@ -968,6 +1027,8 @@
                                 namespace related options
                                 (<varname>PrivateTmp=</varname>,
                                 <varname>PrivateDevices=</varname>,
+                                <varname>ReadOnlySystem=</varname>,
+                                <varname>ProtectedHome=</varname>,
                                 <varname>ReadOnlyDirectories=</varname>,
                                 <varname>InaccessibleDirectories=</varname>
                                 and
@@ -1022,7 +1083,7 @@
                         <varlistentry>
                                 <term><varname>AppArmorProfile=</varname></term>
 
-                                <listitem><para>Take a profile name as argument.
+                                <listitem><para>Takes a profile name as argument.
                                 The process executed by the unit will switch to
                                 this profile when started. Profiles must already
                                 be loaded in the kernel, or the unit will fail.
@@ -1204,22 +1265,22 @@
                                 (which creates connected AF_UNIX
                                 sockets only) are unaffected. Note
                                 that this option has no effect on
-                                32bit x86 and is ignored (but works
+                                32-bit x86 and is ignored (but works
                                 correctly on x86-64). If running in user
                                 mode and this option is used,
                                 <varname>NoNewPrivileges=yes</varname>
-                                is implied. By default no
+                                is implied. By default, no
                                 restriction applies, all address
                                 families are accessible to
                                 processes. If assigned the empty
-                                string any previous list changes are
+                                string, any previous list changes are
                                 undone.</para>
 
                                 <para>Use this option to limit
                                 exposure of processes to remote
                                 systems, in particular via exotic
                                 network protocols. Note that in most
-                                cases the local
+                                cases, the local
                                 <constant>AF_UNIX</constant> address
                                 family should be included in the
                                 configured whitelist as it is
@@ -1239,8 +1300,8 @@
                                 processes. Takes one of
                                 <constant>x86</constant> and
                                 <constant>x86-64</constant>. This is
-                                useful when running 32bit services on
-                                a 64bit host system. If not specified
+                                useful when running 32-bit services on
+                                a 64-bit host system. If not specified,
                                 the personality is left unmodified and
                                 thus reflects the personality of the
                                 host system's
@@ -1252,14 +1313,14 @@
                                 <term><varname>RuntimeDirectoryMode=</varname></term>
 
                                 <listitem><para>Takes a list of
-                                directory names. If set one or more
+                                directory names. If set, one or more
                                 directories by the specified names
                                 will be created below
                                 <filename>/run</filename> (for system
                                 services) or below
                                 <varname>$XDG_RUNTIME_DIR</varname>
                                 (for user services) when the unit is
-                                started and removed when the unit is
+                                started, and removed when the unit is
                                 stopped. The directories will have the
                                 access mode specified in
                                 <varname>RuntimeDirectoryMode=</varname>,
@@ -1275,7 +1336,7 @@
                                 <literal>/</literal>, i.e. must refer
                                 to simple directories to create or
                                 remove. This is particularly useful
-                                for unpriviliges daemons that cannot
+                                for unprivileged daemons that cannot
                                 create runtime directories in
                                 <filename>/run</filename> due to lack
                                 of privileges, and to make sure the
@@ -1411,7 +1472,7 @@
                                 or
                                 <varname>StandardError=tty</varname>).
                                 See
-                                <citerefentry><refentrytitle>termcap</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
+                                <citerefentry project='man-pages'><refentrytitle>termcap</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
                                 </para></listitem>
                         </varlistentry>
                 </variablelist>
@@ -1427,7 +1488,7 @@
                 <varname>systemd.setenv=</varname> (see
                 <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>). Additional
                 variables may also be set through PAM,
-                c.f. <citerefentry><refentrytitle>pam_env</refentrytitle><manvolnum>8</manvolnum></citerefentry>.</para>
+                cf. <citerefentry project='man-pages'><refentrytitle>pam_env</refentrytitle><manvolnum>8</manvolnum></citerefentry>.</para>
         </refsect1>
 
         <refsect1>
@@ -1445,7 +1506,7 @@
                           <citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
                           <citerefentry><refentrytitle>systemd.directives</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
                           <citerefentry><refentrytitle>tmpfiles.d</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-                          <citerefentry><refentrytitle>exec</refentrytitle><manvolnum>3</manvolnum></citerefentry>
+                          <citerefentry project='man-pages'><refentrytitle>exec</refentrytitle><manvolnum>3</manvolnum></citerefentry>
                   </para>
         </refsect1>
 
