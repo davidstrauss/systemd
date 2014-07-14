@@ -385,6 +385,29 @@ static int remove_marked_symlinks(
         return r;
 }
 
+EnabledContext *enabled_context_new(void) {
+        EnabledContext *ec;
+        int r;
+
+        ec = new0(EnabledContext, 1);
+        if (!ec)
+                return NULL;
+
+        r = hashmap_ensure_allocated(&ec->config_paths_and_targets, string_hash_func, string_compare_func);
+        if (r < 0) {
+                free(ec);
+                return NULL;
+        }
+
+        return ec;
+}
+
+void enabled_context_free(EnabledContext *ec) {
+        hashmap_free(ec->config_paths_and_targets);
+        ec->config_paths_and_targets = NULL;
+        free(ec);
+}
+
 static int find_symlinks_fd(
                 const char *name,
                 int fd,
@@ -1690,7 +1713,8 @@ int unit_file_get_default(
 UnitFileState unit_file_get_state(
                 UnitFileScope scope,
                 const char *root_dir,
-                const char *name) {
+                const char *name,
+                EnabledContext *ec) {
 
         _cleanup_lookup_paths_free_ LookupPaths paths = {};
         UnitFileState state = _UNIT_FILE_STATE_INVALID;
@@ -2044,7 +2068,8 @@ static void unitfilelist_free(UnitFileList **f) {
 int unit_file_get_list(
                 UnitFileScope scope,
                 const char *root_dir,
-                Hashmap *h) {
+                Hashmap *h,
+                EnabledContext *ec) {
 
         _cleanup_lookup_paths_free_ LookupPaths paths = {};
         char **i;
