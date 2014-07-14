@@ -542,13 +542,14 @@ static int enabled_context_build_cache(
 static int enabled_context_lookup_state(
         EnabledContext *ec,
         UnitFileScope scope,
+        const char *root_dir,
         const char *name,
         UnitFileState *state) {
 
         _cleanup_lookup_paths_free_ LookupPaths paths = {};
         char **links;
-        char *i;
-        char *p = NULL;
+        char **l;
+        char **p = NULL;
         int r;
 
         assert(ec);
@@ -556,27 +557,27 @@ static int enabled_context_lookup_state(
         assert(scope < _UNIT_FILE_SCOPE_MAX);
         assert(name);
 
-        r = lookup_paths_init_from_scope(&paths, scope);
+        r = lookup_paths_init_from_scope(&paths, scope, root_dir);
         if (r < 0)
                 return r;
 
-        /* Lookup unit name in the cache */
+        /* Look up unit name in the cache */
         links = hashmap_get(ec->symlinks, name);
 
-        STRV_FOREACH_BACKWARDS(i, links) {
+        STRV_FOREACH_BACKWARDS(l, links) {
                 _cleanup_free_ char *dest = NULL;
 
                 /* Check whether the symlink still exists */
-                r = readlink_and_canonicalize(i, &dest);
+                r = readlink_and_canonicalize(*l, &dest);
                 if (r < 0) {
                         if (r == -ENOENT)
-                                strv_remove(links, i);
+                                strv_remove(links, *l);
                         continue;
                 }
 
                 /* Check whether the symlink still points to the unit file */
                 if (!streq(name, basename(dest))) {
-                        strv_remove(links, i);
+                        strv_remove(links, *l);
                         continue;
                 }
 
@@ -586,7 +587,7 @@ static int enabled_context_lookup_state(
                         // and r = get_config_path(scope, false, root_dir, &path2);
                         // to identify UNIT_FILE_LINKED_RUNTIME and UNIT_FILE_LINKED
 
-                        if (path_startswith(i, p)) {
+                        if (path_startswith(*l, *p)) {
                                 *state = UNIT_FILE_ENABLED;
                                 return 1;
                         }
@@ -619,7 +620,7 @@ static int enabled_context_find_symlinks_in_scope(
                 /* By setting ec_cleanup, ec will be freed automatically. */
                 ec_cleanup = ec;
         } else {
-                r = enabled_context_lookup_state(ec, scope, name, state);
+                r = enabled_context_lookup_state(ec, scope, root_dir, name, state);
                 if (r > 0)
                         return r;
         }
@@ -635,7 +636,7 @@ static int enabled_context_find_symlinks_in_scope(
                         enabled_context_build_cache(ec, dir);
         }
 
-        return enabled_context_lookup_state(ec, scope, name, state);
+        return enabled_context_lookup_state(ec, scope, root_dir, name, state);
 }
 
 int unit_file_mask(
