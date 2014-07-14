@@ -413,7 +413,8 @@ static int find_symlinks_fd(
                 int fd,
                 const char *path,
                 const char *config_path,
-                bool *same_name_link) {
+                bool *same_name_link,
+                EnabledContext *ec) {
 
         int r = 0;
         _cleanup_closedir_ DIR *d = NULL;
@@ -467,7 +468,7 @@ static int find_symlinks_fd(
                         }
 
                         /* This will close nfd, regardless whether it succeeds or not */
-                        q = find_symlinks_fd(name, nfd, p, config_path, same_name_link);
+                        q = find_symlinks_fd(name, nfd, p, config_path, same_name_link, ec);
                         if (q > 0)
                                 return 1;
                         if (r == 0)
@@ -531,7 +532,8 @@ static int find_symlinks_fd(
 static int find_symlinks(
                 const char *name,
                 const char *config_path,
-                bool *same_name_link) {
+                bool *same_name_link,
+                EnabledContext *ec) {
 
         int fd;
 
@@ -547,14 +549,15 @@ static int find_symlinks(
         }
 
         /* This takes possession of fd and closes it */
-        return find_symlinks_fd(name, fd, config_path, config_path, same_name_link);
+        return find_symlinks_fd(name, fd, config_path, config_path, same_name_link, ec);
 }
 
 static int find_symlinks_in_scope(
                 UnitFileScope scope,
                 const char *root_dir,
                 const char *name,
-                UnitFileState *state) {
+                UnitFileState *state,
+                EnabledContext *ec) {
 
         int r;
         _cleanup_free_ char *path2 = NULL;
@@ -572,7 +575,7 @@ static int find_symlinks_in_scope(
                 if (r < 0)
                         return r;
 
-                r = find_symlinks(name, path, &same_name_link_runtime);
+                r = find_symlinks(name, path, &same_name_link_runtime, ec);
                 if (r < 0)
                         return r;
                 else if (r > 0) {
@@ -586,7 +589,7 @@ static int find_symlinks_in_scope(
         if (r < 0)
                 return r;
 
-        r = find_symlinks(name, path2, &same_name_link);
+        r = find_symlinks(name, path2, &same_name_link, ec);
         if (r < 0)
                 return r;
         else if (r > 0) {
@@ -1780,7 +1783,7 @@ UnitFileState unit_file_get_state(
                         }
                 }
 
-                r = find_symlinks_in_scope(scope, root_dir, name, &state);
+                r = find_symlinks_in_scope(scope, root_dir, name, &state, ec);
                 if (r < 0)
                         return r;
                 else if (r > 0)
@@ -2152,7 +2155,7 @@ int unit_file_get_list(
                                 goto found;
                         }
 
-                        r = find_symlinks_in_scope(scope, root_dir, de->d_name, &f->state);
+                        r = find_symlinks_in_scope(scope, root_dir, de->d_name, &f->state, ec);
                         if (r < 0)
                                 return r;
                         else if (r > 0) {
