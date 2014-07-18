@@ -84,7 +84,8 @@ typedef struct {
 } InstallInfo;
 
 typedef struct {
-        Hashmap* config_paths_and_targets;
+        Hashmap* config_paths_forward; /* config_path string => symlink name/path => unit_name path */
+        Hashmap* config_paths_reverse; /* config_path string => unit_name/path string => symlink path */
 } EnabledContext;
 
 int unit_file_enable(UnitFileScope scope, bool runtime, const char *root_dir, char **files, bool force, UnitFileChange **changes, unsigned *n_changes);
