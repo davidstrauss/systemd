@@ -65,7 +65,7 @@ typedef const ConfigPerfItem* (*ConfigPerfItemLookup)(const char *section_and_lv
 
 /* Prototype for a generic high-level lookup function */
 typedef int (*ConfigItemLookup)(
-                void *table,
+                const void *table,
                 const char *section,
                 const char *lvalue,
                 ConfigParserCallback *func,
@@ -75,20 +75,21 @@ typedef int (*ConfigItemLookup)(
 
 /* Linear table search implementation of ConfigItemLookup, based on
  * ConfigTableItem arrays */
-int config_item_table_lookup(void *table, const char *section, const char *lvalue, ConfigParserCallback *func, int *ltype, void **data, void *userdata);
+int config_item_table_lookup(const void *table, const char *section, const char *lvalue, ConfigParserCallback *func, int *ltype, void **data, void *userdata);
 
 /* gperf implementation of ConfigItemLookup, based on gperf
  * ConfigPerfItem tables */
-int config_item_perf_lookup(void *table, const char *section, const char *lvalue, ConfigParserCallback *func, int *ltype, void **data, void *userdata);
+int config_item_perf_lookup(const void *table, const char *section, const char *lvalue, ConfigParserCallback *func, int *ltype, void **data, void *userdata);
 
 int config_parse(const char *unit,
                  const char *filename,
                  FILE *f,
                  const char *sections,  /* nulstr */
                  ConfigItemLookup lookup,
-                 void *table,
+                 const void *table,
                  bool relaxed,
                  bool allow_include,
+                 bool warn,
                  void *userdata);
 
 /* Generic parsers */
@@ -169,7 +170,7 @@ int log_syntax_internal(const char *unit, int level,
                      void *userdata) {                                         \
                                                                                \
                 type **enums = data, *xs, x, *ys;                              \
-                char *w, *state;                                               \
+                const char *word, *state;                                      \
                 size_t l, i = 0;                                               \
                                                                                \
                 assert(filename);                                              \
@@ -180,10 +181,10 @@ int log_syntax_internal(const char *unit, int level,
                 xs = new0(type, 1);                                            \
                 *xs = invalid;                                                 \
                                                                                \
-                FOREACH_WORD(w, l, rvalue, state) {                            \
+                FOREACH_WORD(word, l, rvalue, state) {                         \
                         _cleanup_free_ char *en = NULL;                        \
                                                                                \
-                        en = strndup(w, l);                                    \
+                        en = strndup(word, l);                                 \
                         if (!en)                                               \
                                 return -ENOMEM;                                \
                                                                                \

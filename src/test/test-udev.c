@@ -26,7 +26,6 @@
 #include <ctype.h>
 #include <errno.h>
 #include <unistd.h>
-#include <syslog.h>
 #include <grp.h>
 #include <sched.h>
 #include <sys/mount.h>
@@ -79,7 +78,6 @@ static int fake_filesystems(void) {
 out:
         return err;
 }
-
 
 int main(int argc, char *argv[]) {
         _cleanup_udev_unref_ struct udev *udev = NULL;
@@ -155,8 +153,8 @@ int main(int argc, char *argv[]) {
                 }
         }
 
-        udev_event_execute_rules(event, rules, &sigmask_orig);
-        udev_event_execute_run(event, NULL);
+        udev_event_execute_rules(event, 3 * USEC_PER_SEC, USEC_PER_SEC, rules, &sigmask_orig);
+        udev_event_execute_run(event, 3 * USEC_PER_SEC, USEC_PER_SEC, NULL);
 out:
         if (event != NULL && event->fd_signal >= 0)
                 close(event->fd_signal);

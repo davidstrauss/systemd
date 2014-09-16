@@ -61,6 +61,14 @@ typedef enum DHCPSupport {
         _DHCP_SUPPORT_INVALID = -1,
 } DHCPSupport;
 
+typedef enum LLMNRSupport {
+        LLMNR_SUPPORT_NO,
+        LLMNR_SUPPORT_YES,
+        LLMNR_SUPPORT_RESOLVE,
+        _LLMNR_SUPPORT_MAX,
+        _LLMNR_SUPPORT_INVALID = -1,
+} LLMNRSupport;
+
 struct Network {
         Manager *manager;
 
@@ -81,20 +89,20 @@ struct Network {
         char *description;
         NetDev *bridge;
         NetDev *bond;
-        NetDev *tunnel;
-        Hashmap *vlans;
-        Hashmap *macvlans;
-        Hashmap *vxlans;
+        Hashmap *stacked_netdevs;
         DHCPSupport dhcp;
         bool dhcp_dns;
         bool dhcp_ntp;
         bool dhcp_mtu;
         bool dhcp_hostname;
-        bool dhcp_domainname;
+        bool dhcp_domains;
         bool dhcp_sendhost;
+        bool dhcp_broadcast;
         bool dhcp_critical;
         bool dhcp_routes;
+        unsigned dhcp_route_metric;
         bool ipv4ll;
+        bool ipv4ll_route;
 
         bool dhcp_server;
 
@@ -104,19 +112,22 @@ struct Network {
         Hashmap *addresses_by_section;
         Hashmap *routes_by_section;
 
-        LIST_HEAD(Address, dns);
-        LIST_HEAD(Address, ntp);
+        bool wildcard_domain;
+        char **domains, **dns, **ntp;
+
+        LLMNRSupport llmnr;
 
         LIST_FIELDS(Network, networks);
 };
 
 struct Address {
         Network *network;
-        uint64_t section;
+        unsigned section;
 
-        unsigned char family;
+        int family;
         unsigned char prefixlen;
         unsigned char scope;
+        unsigned char flags;
         char *label;
 
         struct in_addr broadcast;
@@ -130,85 +141,25 @@ struct Address {
 
 struct Route {
         Network *network;
-        uint64_t section;
+        unsigned section;
 
-        unsigned char family;
+        int family;
         unsigned char dst_prefixlen;
         unsigned char scope;
         uint32_t metrics;
+        unsigned char protocol;  /* RTPROT_* */
 
         union in_addr_union in_addr;
         union in_addr_union dst_addr;
+        union in_addr_union prefsrc_addr;
 
         LIST_FIELDS(Route, routes);
-};
-
-typedef enum LinkState {
-        LINK_STATE_INITIALIZING,
-        LINK_STATE_ENSLAVING,
-        LINK_STATE_SETTING_ADDRESSES,
-        LINK_STATE_SETTING_ROUTES,
-        LINK_STATE_CONFIGURED,
-        LINK_STATE_UNMANAGED,
-        LINK_STATE_FAILED,
-        LINK_STATE_LINGER,
-        _LINK_STATE_MAX,
-        _LINK_STATE_INVALID = -1
-} LinkState;
-
-typedef enum LinkOperationalState {
-        LINK_OPERSTATE_UNKNOWN,
-        LINK_OPERSTATE_DORMANT,
-        LINK_OPERSTATE_CARRIER,
-        LINK_OPERSTATE_DEGRADED,
-        LINK_OPERSTATE_ROUTABLE,
-        _LINK_OPERSTATE_MAX,
-        _LINK_OPERSTATE_INVALID = -1
-} LinkOperationalState;
-
-struct Link {
-        Manager *manager;
-
-        int n_ref;
-
-        uint64_t ifindex;
-        char *ifname;
-        char *state_file;
-        struct ether_addr mac;
-        struct udev_device *udev_device;
-
-        unsigned flags;
-        uint8_t kernel_operstate;
-
-        Network *network;
-
-        LinkState state;
-        LinkOperationalState operstate;
-
-        unsigned addr_messages;
-        unsigned route_messages;
-        unsigned enslaving;
-
-        LIST_HEAD(Address, addresses);
-
-        sd_dhcp_client *dhcp_client;
-        sd_dhcp_lease *dhcp_lease;
-        char *lease_file;
-        uint16_t original_mtu;
-        sd_ipv4ll *ipv4ll;
-
-        LIST_HEAD(Address, pool_addresses);
-
-        sd_dhcp_server *dhcp_server;
-
-        sd_icmp6_nd *icmp6_router_discovery;
-        sd_dhcp6_client *dhcp6_client;
 };
 
 struct AddressPool {
         Manager *manager;
 
-        unsigned family;
+        int family;
         unsigned prefixlen;
 
         union in_addr_union in_addr;
@@ -254,7 +205,7 @@ int manager_bus_listen(Manager *m);
 
 int manager_save(Manager *m);
 
-int manager_address_pool_acquire(Manager *m, unsigned family, unsigned prefixlen, union in_addr_union *found);
+int manager_address_pool_acquire(Manager *m, int family, unsigned prefixlen, union in_addr_union *found);
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(Manager*, manager_free);
 #define _cleanup_manager_free_ _cleanup_(manager_freep)
@@ -276,6 +227,17 @@ int network_apply(Manager *manager, Network *network, Link *link);
 int config_parse_netdev(const char *unit, const char *filename, unsigned line,
                         const char *section, unsigned section_line, const char *lvalue,
                         int ltype, const char *rvalue, void *data, void *userdata);
+
+int config_parse_domains(const char *unit,
+                         const char *filename,
+                         unsigned line,
+                         const char *section,
+                         unsigned section_line,
+                         const char *lvalue,
+                         int ltype,
+                         const char *rvalue,
+                         void *data,
+                         void *userdata);
 
 int config_parse_tunnel(const char *unit,
                         const char *filename,
@@ -304,7 +266,7 @@ const struct ConfigPerfItem* network_network_gperf_lookup(const char *key, unsig
 
 /* Route */
 int route_new_static(Network *network, unsigned section, Route **ret);
-int route_new_dynamic(Route **ret);
+int route_new_dynamic(Route **ret, unsigned char rtm_protocol);
 void route_free(Route *route);
 int route_configure(Route *route, Link *link, sd_rtnl_message_handler_t callback);
 int route_drop(Route *route, Link *link, sd_rtnl_message_handler_t callback);
@@ -336,10 +298,6 @@ bool address_equal(Address *a1, Address *a2);
 DEFINE_TRIVIAL_CLEANUP_FUNC(Address*, address_free);
 #define _cleanup_address_free_ _cleanup_(address_freep)
 
-int config_parse_dns(const char *unit, const char *filename, unsigned line,
-                     const char *section, unsigned section_line, const char *lvalue,
-                     int ltype, const char *rvalue, void *data, void *userdata);
-
 int config_parse_address(const char *unit, const char *filename, unsigned line,
                          const char *section, unsigned section_line, const char *lvalue,
                          int ltype, const char *rvalue, void *data, void *userdata);
@@ -352,32 +310,6 @@ int config_parse_label(const char *unit, const char *filename, unsigned line,
                        const char *section, unsigned section_line, const char *lvalue,
                        int ltype, const char *rvalue, void *data, void *userdata);
 
-/* Link */
-
-Link *link_unref(Link *link);
-Link *link_ref(Link *link);
-int link_get(Manager *m, int ifindex, Link **ret);
-int link_add(Manager *manager, sd_rtnl_message *message, Link **ret);
-void link_drop(Link *link);
-
-int link_update(Link *link, sd_rtnl_message *message);
-int link_rtnl_process_address(sd_rtnl *rtnl, sd_rtnl_message *message, void *userdata);
-
-int link_initialized(Link *link, struct udev_device *device);
-
-int link_save(Link *link);
-
-bool link_has_carrier(unsigned flags, uint8_t operstate);
-
-const char* link_state_to_string(LinkState s) _const_;
-LinkState link_state_from_string(const char *s) _pure_;
-
-const char* link_operstate_to_string(LinkOperationalState s) _const_;
-LinkOperationalState link_operstate_from_string(const char *s) _pure_;
-
-DEFINE_TRIVIAL_CLEANUP_FUNC(Link*, link_unref);
-#define _cleanup_link_unref_ _cleanup_(link_unrefp)
-
 /* DHCP support */
 
 const char* dhcp_support_to_string(DHCPSupport i) _const_;
@@ -387,10 +319,19 @@ int config_parse_dhcp(const char *unit, const char *filename, unsigned line,
                       const char *section, unsigned section_line, const char *lvalue,
                       int ltype, const char *rvalue, void *data, void *userdata);
 
+/* LLMNR support */
+
+const char* llmnr_support_to_string(LLMNRSupport i) _const_;
+LLMNRSupport llmnr_support_from_string(const char *s) _pure_;
+
+int config_parse_llmnr(const char *unit, const char *filename, unsigned line,
+                      const char *section, unsigned section_line, const char *lvalue,
+                      int ltype, const char *rvalue, void *data, void *userdata);
+
 /* Address Pool */
 
-int address_pool_new(Manager *m, AddressPool **ret, unsigned family, const union in_addr_union *u, unsigned prefixlen);
-int address_pool_new_from_string(Manager *m, AddressPool **ret, unsigned family, const char *p, unsigned prefixlen);
+int address_pool_new(Manager *m, AddressPool **ret, int family, const union in_addr_union *u, unsigned prefixlen);
+int address_pool_new_from_string(Manager *m, AddressPool **ret, int family, const char *p, unsigned prefixlen);
 void address_pool_free(AddressPool *p);
 
 int address_pool_acquire(AddressPool *p, unsigned prefixlen, union in_addr_union *found);

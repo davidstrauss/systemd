@@ -26,7 +26,7 @@
 #include <sys/statvfs.h>
 #include <fnmatch.h>
 
-#include <systemd/sd-id128.h>
+#include "systemd/sd-id128.h"
 #include "util.h"
 #include "condition-util.h"
 #include "virt.h"
@@ -74,7 +74,8 @@ void condition_free_list(Condition *first) {
 }
 
 bool condition_test_kernel_command_line(Condition *c) {
-        char *line, *w, *state, *word = NULL;
+        char *line, *word = NULL;
+        const char *w, *state;
         bool equal;
         int r;
         size_t l, pl;
@@ -113,6 +114,8 @@ bool condition_test_kernel_command_line(Condition *c) {
                 }
 
         }
+        if (!isempty(state))
+                log_warning("Trailing garbage and the end of kernel commandline, ignoring.");
 
         free(word);
         free(line);

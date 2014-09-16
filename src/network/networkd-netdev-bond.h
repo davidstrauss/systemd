@@ -21,9 +21,9 @@
 
 #pragma once
 
-#include "networkd-netdev.h"
+typedef struct Bond Bond;
 
-extern const NetDevVTable bond_vtable;
+#include "networkd-netdev.h"
 
 typedef enum BondMode {
         NETDEV_BOND_MODE_BALANCE_RR,
@@ -37,7 +37,47 @@ typedef enum BondMode {
         _NETDEV_BOND_MODE_INVALID = -1
 } BondMode;
 
+typedef enum BondXmitHashPolicy {
+        NETDEV_BOND_XMIT_HASH_POLICY_LAYER2,
+        NETDEV_BOND_XMIT_HASH_POLICY_LAYER34,
+        NETDEV_BOND_XMIT_HASH_POLICY_LAYER23,
+        NETDEV_BOND_XMIT_HASH_POLICY_ENCAP23,
+        NETDEV_BOND_XMIT_HASH_POLICY_ENCAP34,
+        _NETDEV_BOND_XMIT_HASH_POLICY_MAX,
+        _NETDEV_BOND_XMIT_HASH_POLICY_INVALID = -1
+} BondXmitHashPolicy;
+
+
+typedef enum BondLacpRate {
+        NETDEV_BOND_LACP_RATE_SLOW,
+        NETDEV_BOND_LACP_RATE_FAST,
+        _NETDEV_BOND_LACP_RATE_MAX,
+        _NETDEV_BOND_LACP_RATE_INVALID = -1,
+} BondLacpRate;
+
+struct Bond {
+        NetDev meta;
+
+        BondMode mode;
+        BondXmitHashPolicy xmit_hash_policy;
+        BondLacpRate lacp_rate;
+
+        usec_t miimon;
+        usec_t updelay;
+        usec_t downdelay;
+};
+
+extern const NetDevVTable bond_vtable;
+
 const char *bond_mode_to_string(BondMode d) _const_;
 BondMode bond_mode_from_string(const char *d) _pure_;
 
+const char *bond_xmit_hash_policy_to_string(BondXmitHashPolicy d) _const_;
+BondXmitHashPolicy bond_xmit_hash_policy_from_string(const char *d) _pure_;
+
+const char *bond_lacp_rate_to_string(BondLacpRate d) _const_;
+BondLacpRate bond_lacp_rate_from_string(const char *d) _pure_;
+
 int config_parse_bond_mode(const char *unit, const char *filename, unsigned line, const char *section, unsigned section_line, const char *lvalue, int ltype, const char *rvalue, void *data, void *userdata);
+int config_parse_bond_xmit_hash_policy(const char *unit, const char *filename, unsigned line, const char *section, unsigned section_line, const char *lvalue, int ltype, const char *rvalue, void *data, void *userdata);
+int config_parse_bond_lacp_rate(const char *unit, const char *filename, unsigned line, const char *section, unsigned section_line, const char *lvalue, int ltype, const char *rvalue, void *data, void *userdata);

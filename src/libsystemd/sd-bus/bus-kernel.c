@@ -25,6 +25,7 @@
 
 #include <fcntl.h>
 #include <malloc.h>
+#include <libgen.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 
@@ -542,11 +543,9 @@ static int bus_kernel_make_message(sd_bus *bus, struct kdbus_msg *k) {
                         m->creds.cgroup = d->str;
                         m->creds.mask |= (SD_BUS_CREDS_CGROUP|SD_BUS_CREDS_UNIT|SD_BUS_CREDS_USER_UNIT|SD_BUS_CREDS_SLICE|SD_BUS_CREDS_SESSION|SD_BUS_CREDS_OWNER_UID) & bus->creds_mask;
 
-                        if (!bus->cgroup_root) {
-                                r = cg_get_root_path(&bus->cgroup_root);
-                                if (r < 0)
-                                        goto fail;
-                        }
+                        r = bus_get_root_path(bus);
+                        if (r < 0)
+                                goto fail;
 
                         m->creds.cgroup_root = bus->cgroup_root;
 
@@ -1111,9 +1110,6 @@ int bus_kernel_pop_memfd(sd_bus *bus, void **address, size_t *mapped, size_t *al
 
         if (bus->n_memfd_cache <= 0) {
                 _cleanup_free_ char *g = NULL;
-                struct kdbus_cmd_memfd_make *cmd;
-                struct kdbus_item *item;
-                size_t l, sz;
                 int r;
 
                 assert_se(pthread_mutex_unlock(&bus->memfd_cache_mutex) >= 0);
@@ -1124,26 +1120,14 @@ int bus_kernel_pop_memfd(sd_bus *bus, void **address, size_t *mapped, size_t *al
                 if (!g)
                         return -ENOMEM;
 
-                l = strlen(g);
-                sz = ALIGN8(offsetof(struct kdbus_cmd_memfd_make, items)) +
-                        ALIGN8(offsetof(struct kdbus_item, str)) +
-                        l + 1;
-                cmd = alloca0(sz);
-                cmd->size = sz;
-
-                item = cmd->items;
-                item->size = ALIGN8(offsetof(struct kdbus_item, str)) + l + 1;
-                item->type = KDBUS_ITEM_MEMFD_NAME;
-                memcpy(item->str, g, l + 1);
-
-                r = ioctl(bus->input_fd, KDBUS_CMD_MEMFD_NEW, cmd);
+                r = memfd_create(g, MFD_ALLOW_SEALING);
                 if (r < 0)
                         return -errno;
 
                 *address = NULL;
                 *mapped = 0;
                 *allocated = 0;
-                return cmd->fd;
+                return r;
         }
 
         c = &bus->memfd_cache[--bus->n_memfd_cache];
@@ -1195,7 +1179,7 @@ void bus_kernel_push_memfd(sd_bus *bus, int fd, void *address, size_t mapped, si
 
         /* If overly long, let's return a bit to the OS */
         if (mapped > max_mapped) {
-                assert_se(ioctl(fd, KDBUS_CMD_MEMFD_SIZE_SET, &max_mapped) >= 0);
+                assert_se(ftruncate(fd, max_mapped) >= 0);
                 assert_se(munmap((uint8_t*) address + max_mapped, PAGE_ALIGN(mapped - max_mapped)) >= 0);
                 c->mapped = c->allocated = max_mapped;
         } else {
@@ -1339,19 +1323,19 @@ int bus_kernel_create_bus(const char *name, bool world, char **s) {
         return fd;
 }
 
-static int bus_kernel_translate_access(BusNamePolicyAccess access) {
+static int bus_kernel_translate_access(BusPolicyAccess access) {
         assert(access >= 0);
-        assert(access < _BUSNAME_POLICY_ACCESS_MAX);
+        assert(access < _BUS_POLICY_ACCESS_MAX);
 
         switch (access) {
 
-        case BUSNAME_POLICY_ACCESS_SEE:
+        case BUS_POLICY_ACCESS_SEE:
                 return KDBUS_POLICY_SEE;
 
-        case BUSNAME_POLICY_ACCESS_TALK:
+        case BUS_POLICY_ACCESS_TALK:
                 return KDBUS_POLICY_TALK;
 
-        case BUSNAME_POLICY_ACCESS_OWN:
+        case BUS_POLICY_ACCESS_OWN:
                 return KDBUS_POLICY_OWN;
 
         default:
@@ -1402,11 +1386,20 @@ static int bus_kernel_translate_policy(const BusNamePolicy *policy, struct kdbus
         return 0;
 }
 
-int bus_kernel_open_bus_fd(const char *bus) {
+int bus_kernel_open_bus_fd(const char *bus, char **path) {
         char *p;
         int fd;
+        size_t len;
 
-        p = alloca(strlen("/dev/kdbus/") + DECIMAL_STR_MAX(uid_t) + 1 + strlen(bus) + strlen("/bus") + 1);
+        len = strlen("/dev/kdbus/") + DECIMAL_STR_MAX(uid_t) + 1 + strlen(bus) + strlen("/bus") + 1;
+
+        if (path) {
+                p = malloc(len);
+                if (!p)
+                        return -ENOMEM;
+                *path = p;
+        } else
+                p = alloca(len);
         sprintf(p, "/dev/kdbus/" UID_FMT "-%s/bus", getuid(), bus);
 
         fd = open(p, O_RDWR|O_NOCTTY|O_CLOEXEC);
@@ -1416,13 +1409,102 @@ int bus_kernel_open_bus_fd(const char *bus) {
         return fd;
 }
 
+int bus_kernel_create_endpoint(const char *bus_name, const char *ep_name, char **ep_path) {
+        _cleanup_free_ char *path;
+        struct kdbus_cmd_make *make;
+        struct kdbus_item *n;
+        size_t size;
+        int fd;
+
+        fd = bus_kernel_open_bus_fd(bus_name, &path);
+        if (fd < 0)
+                return fd;
+
+        size = ALIGN8(offsetof(struct kdbus_cmd_make, items));
+        size += ALIGN8(offsetof(struct kdbus_item, str) + strlen(ep_name) + 1);
+
+        make = alloca0(size);
+        make->size = size;
+        make->flags = KDBUS_MAKE_ACCESS_WORLD;
+
+        n = make->items;
+
+        n->type = KDBUS_ITEM_MAKE_NAME;
+        n->size = offsetof(struct kdbus_item, str) + strlen(ep_name) + 1;
+        strcpy(n->str, ep_name);
+
+        if (ioctl(fd, KDBUS_CMD_EP_MAKE, make) < 0) {
+                safe_close(fd);
+                return -errno;
+        }
+
+        /* The higher 32bit of the flags field are considered
+         * 'incompatible flags'. Refuse them all for now. */
+        if (make->flags > 0xFFFFFFFFULL) {
+                safe_close(fd);
+                return -ENOTSUP;
+        }
+
+        if (ep_path) {
+                asprintf(ep_path, "%s/%s", dirname(path), ep_name);
+                if (!*ep_path)
+                        return -ENOMEM;
+        }
+
+        return fd;
+}
+
+int bus_kernel_set_endpoint_policy(int fd, uid_t uid, BusEndpoint *ep) {
+
+        struct kdbus_cmd_update *update;
+        struct kdbus_item *n;
+        BusEndpointPolicy *po;
+        Iterator i;
+        size_t size;
+        int r;
+
+        size = ALIGN8(offsetof(struct kdbus_cmd_update, items));
+
+        HASHMAP_FOREACH(po, ep->policy_hash, i) {
+                size += ALIGN8(offsetof(struct kdbus_item, str) + strlen(po->name) + 1);
+                size += ALIGN8(offsetof(struct kdbus_item, policy_access) + sizeof(struct kdbus_policy_access));
+        }
+
+        update = alloca0(size);
+        update->size = size;
+
+        n = update->items;
+
+        HASHMAP_FOREACH(po, ep->policy_hash, i) {
+                n->type = KDBUS_ITEM_NAME;
+                n->size = offsetof(struct kdbus_item, str) + strlen(po->name) + 1;
+                strcpy(n->str, po->name);
+                n = KDBUS_ITEM_NEXT(n);
+
+                n->type = KDBUS_ITEM_POLICY_ACCESS;
+                n->size = offsetof(struct kdbus_item, policy_access) + sizeof(struct kdbus_policy_access);
+
+                n->policy_access.type = KDBUS_POLICY_ACCESS_USER;
+                n->policy_access.access = bus_kernel_translate_access(po->access);
+                n->policy_access.id = uid;
+
+                n = KDBUS_ITEM_NEXT(n);
+        }
+
+        r = ioctl(fd, KDBUS_CMD_EP_UPDATE, update);
+        if (r < 0)
+                return -errno;
+
+        return 0;
+}
+
 int bus_kernel_make_starter(
                 int fd,
                 const char *name,
                 bool activating,
                 bool accept_fd,
                 BusNamePolicy *policy,
-                BusNamePolicyAccess world_policy) {
+                BusPolicyAccess world_policy) {
 
         struct kdbus_cmd_hello *hello;
         struct kdbus_item *n;
@@ -1538,37 +1620,6 @@ int bus_kernel_create_domain(const char *name, char **s) {
                 }
 
                 *s = p;
-        }
-
-        return fd;
-}
-
-int bus_kernel_create_monitor(const char *bus) {
-        struct kdbus_cmd_hello *hello;
-        int fd;
-
-        assert(bus);
-
-        fd = bus_kernel_open_bus_fd(bus);
-        if (fd < 0)
-                return fd;
-
-        hello = alloca0(sizeof(struct kdbus_cmd_hello));
-        hello->size = sizeof(struct kdbus_cmd_hello);
-        hello->conn_flags = KDBUS_HELLO_ACTIVATOR;
-        hello->pool_size = KDBUS_POOL_SIZE;
-
-        if (ioctl(fd, KDBUS_CMD_HELLO, hello) < 0) {
-                safe_close(fd);
-                return -errno;
-        }
-
-        /* The higher 32bit of both flags fields are considered
-         * 'incompatible flags'. Refuse them all for now. */
-        if (hello->bus_flags > 0xFFFFFFFFULL ||
-            hello->conn_flags > 0xFFFFFFFFULL) {
-                safe_close(fd);
-                return -ENOTSUP;
         }
 
         return fd;

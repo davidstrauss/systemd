@@ -473,38 +473,35 @@ static int process_suffix_chop(const char *arg) {
         return -EINVAL;
 }
 
-static int help(void) {
-
+static void help(void) {
         printf("%s [OPTIONS...] [SUFFIX...]\n\n"
                "Find overridden configuration files.\n\n"
                "  -h --help           Show this help\n"
                "     --version        Show package version\n"
                "     --no-pager       Do not pipe output into a pager\n"
                "     --diff[=1|0]     Show a diff when overridden files differ\n"
-               "  -t --type=LIST...   Only display a selected set of override types\n",
-               program_invocation_short_name);
-
-        return 0;
+               "  -t --type=LIST...   Only display a selected set of override types\n"
+               , program_invocation_short_name);
 }
 
 static int parse_flags(const char *flag_str, int flags) {
-        char *w, *state;
+        const char *word, *state;
         size_t l;
 
-        FOREACH_WORD(w, l, flag_str, state) {
-                if (strneq("masked", w, l))
+        FOREACH_WORD(word, l, flag_str, state) {
+                if (strneq("masked", word, l))
                         flags |= SHOW_MASKED;
-                else if (strneq ("equivalent", w, l))
+                else if (strneq ("equivalent", word, l))
                         flags |= SHOW_EQUIVALENT;
-                else if (strneq("redirected", w, l))
+                else if (strneq("redirected", word, l))
                         flags |= SHOW_REDIRECTED;
-                else if (strneq("overridden", w, l))
+                else if (strneq("overridden", word, l))
                         flags |= SHOW_OVERRIDDEN;
-                else if (strneq("unchanged", w, l))
+                else if (strneq("unchanged", word, l))
                         flags |= SHOW_UNCHANGED;
-                else if (strneq("extended", w, l))
+                else if (strneq("extended", word, l))
                         flags |= SHOW_EXTENDED;
-                else if (strneq("default", w, l))
+                else if (strneq("default", word, l))
                         flags |= SHOW_DEFAULTS;
                 else
                         return -EINVAL;
@@ -534,7 +531,7 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 1);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "ht:", options, NULL)) >= 0) {
+        while ((c = getopt_long(argc, argv, "ht:", options, NULL)) >= 0)
 
                 switch (c) {
 
@@ -585,7 +582,6 @@ static int parse_argv(int argc, char *argv[]) {
                 default:
                         assert_not_reached("Unhandled option");
                 }
-        }
 
         return 1;
 }

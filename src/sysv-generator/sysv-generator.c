@@ -442,15 +442,15 @@ static int load_sysv(SysvStub *s) {
                 } else if (state == LSB || state == LSB_DESCRIPTION) {
 
                         if (startswith_no_case(t, "Provides:")) {
-                                char *i, *w;
+                                const char *word, *state_;
                                 size_t z;
 
                                 state = LSB;
 
-                                FOREACH_WORD_QUOTED(w, z, t+9, i) {
+                                FOREACH_WORD_QUOTED(word, z, t+9, state_) {
                                         _cleanup_free_ char *n = NULL, *m = NULL;
 
-                                        n = strndup(w, z);
+                                        n = strndup(word, z);
                                         if (!n)
                                                 return -ENOMEM;
 
@@ -482,6 +482,11 @@ static int load_sysv(SysvStub *s) {
                                                 r = strv_extend(&s->wants, m);
                                                 if (r < 0)
                                                         return log_oom();
+                                                if (streq(m, SPECIAL_NETWORK_ONLINE_TARGET)) {
+                                                        r = strv_extend(&s->before, SPECIAL_NETWORK_TARGET);
+                                                        if (r < 0)
+                                                                return log_oom();
+                                                }
                                         }
 
                                         if (r < 0)
@@ -489,21 +494,25 @@ static int load_sysv(SysvStub *s) {
                                                                "[%s:%u] Failed to add LSB Provides name %s, ignoring: %s",
                                                                s->path, line, m, strerror(-r));
                                 }
+                                if (!isempty(state_))
+                                        log_error_unit(s->name,
+                                                       "[%s:%u] Trailing garbage in Provides, ignoring.",
+                                                       s->path, line);
 
                         } else if (startswith_no_case(t, "Required-Start:") ||
                                    startswith_no_case(t, "Should-Start:") ||
                                    startswith_no_case(t, "X-Start-Before:") ||
                                    startswith_no_case(t, "X-Start-After:")) {
-                                char *i, *w;
+                                const char *word, *state_;
                                 size_t z;
 
                                 state = LSB;
 
-                                FOREACH_WORD_QUOTED(w, z, strchr(t, ':')+1, i) {
+                                FOREACH_WORD_QUOTED(word, z, strchr(t, ':')+1, state_) {
                                         _cleanup_free_ char *n = NULL, *m = NULL;
                                         bool is_before;
 
-                                        n = strndup(w, z);
+                                        n = strndup(word, z);
                                         if (!n)
                                                 return -ENOMEM;
 
@@ -547,6 +556,11 @@ static int load_sysv(SysvStub *s) {
                                                                "[%s:%u] Failed to add dependency on %s, ignoring: %s",
                                                                s->path, line, m, strerror(-r));
                                 }
+                                if (!isempty(state_))
+                                        log_error_unit(s->name,
+                                                       "[%s:%u] Trailing garbage in %*s, ignoring.",
+                                                       s->path, line,
+                                                       (int)(strchr(t, ':') - t), t);
 
                         } else if (startswith_no_case(t, "Description:")) {
                                 char *d, *j;

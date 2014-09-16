@@ -1,5 +1,8 @@
-
 - 8ch indent, no tabs
+
+- Don't break code lines too eagerly. We do *not* force line breaks at
+  80ch, all of today's screens should be much larger than that. But
+  then again, don't overdo it, ~140ch should be enough really.
 
 - Variables and functions *must* be static, unless they have a
   prototype, and are supposed to be exported.
@@ -152,7 +155,7 @@
   function or a "non-logging" function. "Logging" functions do logging
   on their own, "non-logging" function never log on their own and
   expect their callers to log. All functions in "library" code,
-  i.e. in src/shared/ and suchlike must be "non-logging". Everytime a
+  i.e. in src/shared/ and suchlike must be "non-logging". Every time a
   "logging" function calls a "non-logging" function, it should log
   about the resulting errors. If a "logging" function calls another
   "logging" function, then it should not generate log messages, so
@@ -167,3 +170,8 @@
   caching for any thread that is not the main thread. Use
   is_main_thread() to detect whether the calling thread is the main
   thread.
+
+- Option parsing:
+  - Do not print full help() on error, be specific about the error.
+  - Do not print messages to stdout on error.
+  - Do not POSIX_ME_HARDER unless necessary, i.e. avoid "+" in option string.

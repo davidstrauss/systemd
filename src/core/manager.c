@@ -241,6 +241,9 @@ static int manager_setup_time_change(Manager *m) {
         assert(m);
         assert_cc(sizeof(time_t) == sizeof(TIME_T_MAX));
 
+        if (m->test_run)
+                return 0;
+
         /* Uses TFD_TIMER_CANCEL_ON_SET to get notifications whenever
          * CLOCK_REALTIME makes a jump relative to CLOCK_MONOTONIC */
 
@@ -302,6 +305,9 @@ static int manager_setup_signals(Manager *m) {
 
         assert(m);
 
+        if (m->test_run)
+                return 0;
+
         /* We are not interested in SIGSTOP and friends. */
         assert_se(sigaction(SIGCHLD, &sa, NULL) == 0);
 
@@ -335,7 +341,7 @@ static int manager_setup_signals(Manager *m) {
                         SIGRTMIN+26, /* systemd: set log target to journal-or-kmsg */
                         SIGRTMIN+27, /* systemd: set log target to console */
                         SIGRTMIN+28, /* systemd: set log target to kmsg */
-                        SIGRTMIN+29, /* systemd: set log target to syslog-or-kmsg */
+                        SIGRTMIN+29, /* systemd: set log target to syslog-or-kmsg (obsolete)*/
                         -1);
         assert_se(sigprocmask(SIG_SETMASK, &mask, NULL) == 0);
 
@@ -409,7 +415,7 @@ static int manager_default_environment(Manager *m) {
         return 0;
 }
 
-int manager_new(SystemdRunningAs running_as, Manager **_m) {
+int manager_new(SystemdRunningAs running_as, bool test_run, Manager **_m) {
         Manager *m;
         int r;
 
@@ -429,11 +435,15 @@ int manager_new(SystemdRunningAs running_as, Manager **_m) {
         m->running_as = running_as;
         m->exit_code = _MANAGER_EXIT_CODE_INVALID;
         m->default_timer_accuracy_usec = USEC_PER_MINUTE;
+        m->start_timeout_usec = DEFAULT_MANAGER_START_TIMEOUT_USEC;
+        m->start_timeout_action = FAILURE_ACTION_POWEROFF_FORCE;
 
         m->idle_pipe[0] = m->idle_pipe[1] = m->idle_pipe[2] = m->idle_pipe[3] = -1;
 
         m->pin_cgroupfs_fd = m->notify_fd = m->signal_fd = m->time_change_fd = m->dev_autofs_fd = m->private_listen_fd = m->kdbus_fd = -1;
         m->current_job_id = 1; /* start as id #1, so that we can leave #0 around as "null-like" value */
+
+        m->test_run = test_run;
 
         r = manager_default_environment(m);
         if (r < 0)
@@ -518,15 +528,15 @@ fail:
 static int manager_setup_notify(Manager *m) {
         int r;
 
+        if (m->test_run)
+                return 0;
+
         if (m->notify_fd < 0) {
                 _cleanup_close_ int fd = -1;
-                union {
-                        struct sockaddr sa;
-                        struct sockaddr_un un;
-                } sa = {
+                union sockaddr_union sa =  {
                         .sa.sa_family = AF_UNIX,
                 };
-                int one = 1;
+                static const int one = 1;
 
                 /* First free all secondary fields */
                 free(m->notify_socket);
@@ -558,7 +568,7 @@ static int manager_setup_notify(Manager *m) {
                 strncpy(sa.un.sun_path, m->notify_socket, sizeof(sa.un.sun_path)-1);
                 r = bind(fd, &sa.sa, offsetof(struct sockaddr_un, sun_path) + strlen(sa.un.sun_path));
                 if (r < 0) {
-                        log_error("bind() failed: %m");
+                        log_error("bind(%s) failed: %m", sa.un.sun_path);
                         return -errno;
                 }
 
@@ -596,12 +606,10 @@ static int manager_setup_notify(Manager *m) {
 static int manager_setup_kdbus(Manager *m) {
 #ifdef ENABLE_KDBUS
         _cleanup_free_ char *p = NULL;
-#endif
 
-#ifdef ENABLE_KDBUS
         assert(m);
 
-        if (m->kdbus_fd >= 0)
+        if (m->test_run || m->kdbus_fd >= 0)
                 return 0;
 
         m->kdbus_fd = bus_kernel_create_bus(m->running_as == SYSTEMD_SYSTEM ? "system" : "user", m->running_as == SYSTEMD_SYSTEM, &p);
@@ -627,6 +635,9 @@ static int manager_connect_bus(Manager *m, bool reexecuting) {
         bool try_bus_connect;
 
         assert(m);
+
+        if (m->test_run)
+                return 0;
 
         try_bus_connect =
                 m->kdbus_fd >= 0 ||
@@ -819,6 +830,9 @@ void manager_free(Manager *m) {
 
         manager_close_idle_pipe(m);
 
+        sd_event_source_unref(m->start_timeout_event_source);
+        free(m->start_timeout_reboot_arg);
+
         udev_unref(m->udev);
         sd_event_unref(m->event);
 
@@ -887,7 +901,7 @@ static int manager_coldplug(Manager *m) {
 
 static void manager_build_unit_path_cache(Manager *m) {
         char **i;
-        _cleanup_free_ DIR *d = NULL;
+        _cleanup_closedir_ DIR *d = NULL;
         int r;
 
         assert(m);
@@ -966,6 +980,20 @@ static int manager_distribute_fds(Manager *m, FDSet *fds) {
         return 0;
 }
 
+static int on_start_timeout(sd_event_source *s, usec_t usec, void *userdata) {
+        Manager *m = userdata;
+
+        assert(s);
+        assert(m);
+
+        m->start_timeout_event_source = sd_event_source_unref(m->start_timeout_event_source);
+
+        log_error("Startup timed out.");
+
+        failure_action(m, m->start_timeout_action, m->start_timeout_reboot_arg);
+        return 0;
+}
+
 int manager_startup(Manager *m, FILE *serialization, FDSet *fds) {
         int r, q;
 
@@ -998,11 +1026,8 @@ int manager_startup(Manager *m, FILE *serialization, FDSet *fds) {
         dual_timestamp_get(&m->units_load_finish_timestamp);
 
         /* Second, deserialize if there is something to deserialize */
-        if (serialization) {
-                q = manager_deserialize(m, serialization, fds);
-                if (q < 0)
-                        r = q;
-        }
+        if (serialization)
+                r = manager_deserialize(m, serialization, fds);
 
         /* Any fds left? Find some unit which wants them. This is
          * useful to allow container managers to pass some file
@@ -1010,13 +1035,15 @@ int manager_startup(Manager *m, FILE *serialization, FDSet *fds) {
          * socket-based activation of entire containers. */
         if (fdset_size(fds) > 0) {
                 q = manager_distribute_fds(m, fds);
-                if (q < 0)
+                if (q < 0 && r == 0)
                         r = q;
         }
 
         /* We might have deserialized the notify fd, but if we didn't
          * then let's create the bus now */
-        manager_setup_notify(m);
+        q = manager_setup_notify(m);
+        if (q < 0 && r == 0)
+                r = q;
 
         /* We might have deserialized the kdbus control fd, but if we
          * didn't, then let's create the bus now. */
@@ -1026,7 +1053,7 @@ int manager_startup(Manager *m, FILE *serialization, FDSet *fds) {
 
         /* Third, fire things up! */
         q = manager_coldplug(m);
-        if (q < 0)
+        if (q < 0 && r == 0)
                 r = q;
 
         if (serialization) {
@@ -1037,6 +1064,22 @@ int manager_startup(Manager *m, FILE *serialization, FDSet *fds) {
                  * sent, before we notify that the reload is
                  * finished */
                 m->send_reloading_done = true;
+        }
+
+        /* Possibly set up a start timeout */
+        if (!dual_timestamp_is_set(&m->finish_timestamp)) {
+                m->start_timeout_event_source = sd_event_source_unref(m->start_timeout_event_source);
+
+                if (m->start_timeout_usec) {
+                        r = sd_event_add_time(
+                                        m->event,
+                                        &m->start_timeout_event_source,
+                                        CLOCK_MONOTONIC,
+                                        now(CLOCK_MONOTONIC) + m->start_timeout_usec, 0,
+                                        on_start_timeout, m);
+                        if (r < 0)
+                                log_error("Failed to add start timeout event: %s", strerror(-r));
+                }
         }
 
         return r;
@@ -1395,7 +1438,7 @@ static int manager_dispatch_notify_fd(sd_event_source *source, int fd, uint32_t 
                         .msg_controllen = sizeof(control),
                 };
                 struct ucred *ucred;
-                Unit *u;
+                Unit *u1, *u2, *u3;
 
                 n = recvmsg(m->notify_fd, &msghdr, MSG_DONTWAIT);
                 if (n <= 0) {
@@ -1421,21 +1464,23 @@ static int manager_dispatch_notify_fd(sd_event_source *source, int fd, uint32_t 
                 assert((size_t) n < sizeof(buf));
                 buf[n] = 0;
 
-                u = manager_get_unit_by_pid(m, ucred->pid);
-                if (u) {
-                        manager_invoke_notify_message(m, u, ucred->pid, buf, n);
+                /* Notify every unit that might be interested, but try
+                 * to avoid notifying the same one multiple times. */
+                u1 = manager_get_unit_by_pid(m, ucred->pid);
+                if (u1) {
+                        manager_invoke_notify_message(m, u1, ucred->pid, buf, n);
                         found = true;
                 }
 
-                u = hashmap_get(m->watch_pids1, LONG_TO_PTR(ucred->pid));
-                if (u) {
-                        manager_invoke_notify_message(m, u, ucred->pid, buf, n);
+                u2 = hashmap_get(m->watch_pids1, LONG_TO_PTR(ucred->pid));
+                if (u2 && u2 != u1) {
+                        manager_invoke_notify_message(m, u2, ucred->pid, buf, n);
                         found = true;
                 }
 
-                u = hashmap_get(m->watch_pids2, LONG_TO_PTR(ucred->pid));
-                if (u) {
-                        manager_invoke_notify_message(m, u, ucred->pid, buf, n);
+                u3 = hashmap_get(m->watch_pids2, LONG_TO_PTR(ucred->pid));
+                if (u3 && u3 != u2 && u3 != u1) {
+                        manager_invoke_notify_message(m, u3, ucred->pid, buf, n);
                         found = true;
                 }
 
@@ -1482,7 +1527,7 @@ static int manager_dispatch_sigchld(Manager *m) {
 
                 if (si.si_code == CLD_EXITED || si.si_code == CLD_KILLED || si.si_code == CLD_DUMPED) {
                         _cleanup_free_ char *name = NULL;
-                        Unit *u;
+                        Unit *u1, *u2, *u3;
 
                         get_process_comm(si.si_pid, &name);
 
@@ -1496,15 +1541,15 @@ static int manager_dispatch_sigchld(Manager *m) {
 
                         /* And now figure out the unit this belongs
                          * to, it might be multiple... */
-                        u = manager_get_unit_by_pid(m, si.si_pid);
-                        if (u)
-                                invoke_sigchld_event(m, u, &si);
-                        u = hashmap_get(m->watch_pids1, LONG_TO_PTR(si.si_pid));
-                        if (u)
-                                invoke_sigchld_event(m, u, &si);
-                        u = hashmap_get(m->watch_pids2, LONG_TO_PTR(si.si_pid));
-                        if (u)
-                                invoke_sigchld_event(m, u, &si);
+                        u1 = manager_get_unit_by_pid(m, si.si_pid);
+                        if (u1)
+                                invoke_sigchld_event(m, u1, &si);
+                        u2 = hashmap_get(m->watch_pids1, LONG_TO_PTR(si.si_pid));
+                        if (u2 && u2 != u1)
+                                invoke_sigchld_event(m, u2, &si);
+                        u3 = hashmap_get(m->watch_pids2, LONG_TO_PTR(si.si_pid));
+                        if (u3 && u3 != u2 && u3 != u1)
+                                invoke_sigchld_event(m, u3, &si);
                 }
 
                 /* And now, we actually reap the zombie. */
@@ -1725,6 +1770,7 @@ static int manager_dispatch_signal_fd(sd_event_source *source, int fd, uint32_t 
                                 break;
 
                         case 26:
+                        case 29: /* compatibility: used to be mapped to LOG_TARGET_SYSLOG_OR_KMSG */
                                 log_set_target(LOG_TARGET_JOURNAL_OR_KMSG);
                                 log_notice("Setting log target to journal-or-kmsg.");
                                 break;
@@ -1737,11 +1783,6 @@ static int manager_dispatch_signal_fd(sd_event_source *source, int fd, uint32_t 
                         case 28:
                                 log_set_target(LOG_TARGET_KMSG);
                                 log_notice("Setting log target to kmsg.");
-                                break;
-
-                        case 29:
-                                log_set_target(LOG_TARGET_SYSLOG_OR_KMSG);
-                                log_notice("Setting log target to syslog-or-kmsg.");
                                 break;
 
                         default:
@@ -1869,7 +1910,7 @@ int manager_loop(Manager *m) {
                         if (wait_usec <= 0)
                                 wait_usec = 1;
                 } else
-                        wait_usec = (usec_t) -1;
+                        wait_usec = USEC_INFINITY;
 
                 r = sd_event_run(m->event, wait_usec);
                 if (r < 0) {
@@ -1971,10 +2012,7 @@ void manager_send_unit_audit(Manager *m, Unit *u, int type, bool success) {
 }
 
 void manager_send_unit_plymouth(Manager *m, Unit *u) {
-        union sockaddr_union sa = {
-                .un.sun_family = AF_UNIX,
-                .un.sun_path = "\0/org/freedesktop/plymouthd",
-        };
+        union sockaddr_union sa = PLYMOUTH_SOCKET;
 
         int n = 0;
         _cleanup_free_ char *message = NULL;
@@ -2464,10 +2502,8 @@ void manager_check_finished(Manager *m) {
 
         if (hashmap_size(m->jobs) > 0) {
 
-                if (m->jobs_in_progress_event_source) {
-                        sd_event_source_set_time(m->jobs_in_progress_event_source,
-                                                 now(CLOCK_MONOTONIC) + JOBS_IN_PROGRESS_WAIT_USEC);
-                }
+                if (m->jobs_in_progress_event_source)
+                        sd_event_source_set_time(m->jobs_in_progress_event_source, now(CLOCK_MONOTONIC) + JOBS_IN_PROGRESS_WAIT_USEC);
 
                 return;
         }
@@ -2489,6 +2525,8 @@ void manager_check_finished(Manager *m) {
 
         dual_timestamp_get(&m->finish_timestamp);
 
+        m->start_timeout_event_source = sd_event_source_unref(m->start_timeout_event_source);
+
         if (m->running_as == SYSTEMD_SYSTEM && detect_container(NULL) <= 0) {
 
                 /* Note that m->kernel_usec.monotonic is always at 0,
@@ -2506,53 +2544,52 @@ void manager_check_finished(Manager *m) {
                         kernel_usec = m->initrd_timestamp.monotonic - m->kernel_timestamp.monotonic;
                         initrd_usec = m->userspace_timestamp.monotonic - m->initrd_timestamp.monotonic;
 
-                        if (!log_on_console())
-                                log_struct(LOG_INFO,
-                                           MESSAGE_ID(SD_MESSAGE_STARTUP_FINISHED),
-                                           "KERNEL_USEC="USEC_FMT, kernel_usec,
-                                           "INITRD_USEC="USEC_FMT, initrd_usec,
-                                           "USERSPACE_USEC="USEC_FMT, userspace_usec,
-                                           "MESSAGE=Startup finished in %s (kernel) + %s (initrd) + %s (userspace) = %s.",
-                                           format_timespan(kernel, sizeof(kernel), kernel_usec, USEC_PER_MSEC),
-                                           format_timespan(initrd, sizeof(initrd), initrd_usec, USEC_PER_MSEC),
-                                           format_timespan(userspace, sizeof(userspace), userspace_usec, USEC_PER_MSEC),
-                                           format_timespan(sum, sizeof(sum), total_usec, USEC_PER_MSEC),
-                                           NULL);
+                        log_struct(LOG_INFO,
+                                   MESSAGE_ID(SD_MESSAGE_STARTUP_FINISHED),
+                                   "KERNEL_USEC="USEC_FMT, kernel_usec,
+                                   "INITRD_USEC="USEC_FMT, initrd_usec,
+                                   "USERSPACE_USEC="USEC_FMT, userspace_usec,
+                                   "MESSAGE=Startup finished in %s (kernel) + %s (initrd) + %s (userspace) = %s.",
+                                   format_timespan(kernel, sizeof(kernel), kernel_usec, USEC_PER_MSEC),
+                                   format_timespan(initrd, sizeof(initrd), initrd_usec, USEC_PER_MSEC),
+                                   format_timespan(userspace, sizeof(userspace), userspace_usec, USEC_PER_MSEC),
+                                   format_timespan(sum, sizeof(sum), total_usec, USEC_PER_MSEC),
+                                   NULL);
                 } else {
                         kernel_usec = m->userspace_timestamp.monotonic - m->kernel_timestamp.monotonic;
                         initrd_usec = 0;
 
-                        if (!log_on_console())
-                                log_struct(LOG_INFO,
-                                           MESSAGE_ID(SD_MESSAGE_STARTUP_FINISHED),
-                                           "KERNEL_USEC="USEC_FMT, kernel_usec,
-                                           "USERSPACE_USEC="USEC_FMT, userspace_usec,
-                                           "MESSAGE=Startup finished in %s (kernel) + %s (userspace) = %s.",
-                                           format_timespan(kernel, sizeof(kernel), kernel_usec, USEC_PER_MSEC),
-                                           format_timespan(userspace, sizeof(userspace), userspace_usec, USEC_PER_MSEC),
-                                           format_timespan(sum, sizeof(sum), total_usec, USEC_PER_MSEC),
-                                           NULL);
+                        log_struct(LOG_INFO,
+                                   MESSAGE_ID(SD_MESSAGE_STARTUP_FINISHED),
+                                   "KERNEL_USEC="USEC_FMT, kernel_usec,
+                                   "USERSPACE_USEC="USEC_FMT, userspace_usec,
+                                   "MESSAGE=Startup finished in %s (kernel) + %s (userspace) = %s.",
+                                   format_timespan(kernel, sizeof(kernel), kernel_usec, USEC_PER_MSEC),
+                                   format_timespan(userspace, sizeof(userspace), userspace_usec, USEC_PER_MSEC),
+                                   format_timespan(sum, sizeof(sum), total_usec, USEC_PER_MSEC),
+                                   NULL);
                 }
         } else {
                 firmware_usec = loader_usec = initrd_usec = kernel_usec = 0;
                 total_usec = userspace_usec = m->finish_timestamp.monotonic - m->userspace_timestamp.monotonic;
 
-                if (!log_on_console())
-                        log_struct(LOG_INFO,
-                                   MESSAGE_ID(SD_MESSAGE_STARTUP_FINISHED),
-                                   "USERSPACE_USEC="USEC_FMT, userspace_usec,
-                                   "MESSAGE=Startup finished in %s.",
-                                   format_timespan(sum, sizeof(sum), total_usec, USEC_PER_MSEC),
-                                   NULL);
+                log_struct(LOG_INFO,
+                           MESSAGE_ID(SD_MESSAGE_STARTUP_FINISHED),
+                           "USERSPACE_USEC="USEC_FMT, userspace_usec,
+                           "MESSAGE=Startup finished in %s.",
+                           format_timespan(sum, sizeof(sum), total_usec, USEC_PER_MSEC),
+                           NULL);
         }
 
         SET_FOREACH(u, m->startup_units, i)
-                cgroup_context_apply(unit_get_cgroup_context(u), unit_get_cgroup_mask(u), u->cgroup_path, manager_state(m));
+                if (u->cgroup_path)
+                        cgroup_context_apply(unit_get_cgroup_context(u), unit_get_cgroup_mask(u), u->cgroup_path, manager_state(m));
 
         bus_manager_send_finished(m, firmware_usec, loader_usec, kernel_usec, initrd_usec, userspace_usec, total_usec);
 
         sd_notifyf(false,
-                   "READY=1\nSTATUS=Startup finished in %s.",
+                   "READY=1\n"
+                   "STATUS=Startup finished in %s.",
                    format_timespan(sum, sizeof(sum), total_usec, USEC_PER_MSEC));
 }
 
@@ -2639,6 +2676,9 @@ void manager_run_generators(Manager *m) {
         int r;
 
         assert(m);
+
+        if (m->test_run)
+                return;
 
         generator_path = m->running_as == SYSTEMD_SYSTEM ? SYSTEM_GENERATOR_PATH : USER_GENERATOR_PATH;
         d = opendir(generator_path);
@@ -2802,7 +2842,7 @@ static bool manager_get_show_status(Manager *m) {
         if (m->no_console_output)
                 return false;
 
-        if (!IN_SET(manager_state(m), MANAGER_STARTING, MANAGER_STOPPING))
+        if (!IN_SET(manager_state(m), MANAGER_INITIALIZING, MANAGER_STARTING, MANAGER_STOPPING))
                 return false;
 
         if (m->show_status > 0)
@@ -2893,8 +2933,14 @@ ManagerState manager_state(Manager *m) {
         assert(m);
 
         /* Did we ever finish booting? If not then we are still starting up */
-        if (!dual_timestamp_is_set(&m->finish_timestamp))
+        if (!dual_timestamp_is_set(&m->finish_timestamp)) {
+
+                u = manager_get_unit(m, SPECIAL_BASIC_TARGET);
+                if (!u || !UNIT_IS_ACTIVE_OR_RELOADING(unit_active_state(u)))
+                        return MANAGER_INITIALIZING;
+
                 return MANAGER_STARTING;
+        }
 
         /* Is the special shutdown target queued? If so, we are in shutdown state */
         u = manager_get_unit(m, SPECIAL_SHUTDOWN_TARGET);
@@ -2920,6 +2966,7 @@ ManagerState manager_state(Manager *m) {
 }
 
 static const char *const manager_state_table[_MANAGER_STATE_MAX] = {
+        [MANAGER_INITIALIZING] = "initializing",
         [MANAGER_STARTING] = "starting",
         [MANAGER_RUNNING] = "running",
         [MANAGER_DEGRADED] = "degraded",

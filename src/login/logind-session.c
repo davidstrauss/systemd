@@ -44,21 +44,6 @@
 
 static void session_remove_fifo(Session *s);
 
-static unsigned long devt_hash_func(const void *p, const uint8_t hash_key[HASH_KEY_SIZE]) {
-        uint64_t u = *(const dev_t*)p;
-
-        return uint64_hash_func(&u, hash_key);
-}
-
-static int devt_compare_func(const void *_a, const void *_b) {
-        dev_t a, b;
-
-        a = *(const dev_t*) _a;
-        b = *(const dev_t*) _b;
-
-        return a < b ? -1 : (a > b ? 1 : 0);
-}
-
 Session* session_new(Manager *m, const char *id) {
         Session *s;
 
@@ -152,8 +137,6 @@ void session_free(Session *s) {
         free(s->desktop);
 
         hashmap_remove(s->manager->sessions, s->id);
-
-        s->vt_source = sd_event_source_unref(s->vt_source);
 
         free(s->state_file);
         free(s);
@@ -978,8 +961,8 @@ int session_kill(Session *s, KillWho who, int signo) {
 static int session_open_vt(Session *s) {
         char path[sizeof("/dev/tty") + DECIMAL_STR_MAX(s->vtnr)];
 
-        if (!s->vtnr)
-                return -1;
+        if (s->vtnr < 1)
+                return -ENODEV;
 
         if (s->vtfd >= 0)
                 return s->vtfd;
@@ -994,59 +977,56 @@ static int session_open_vt(Session *s) {
         return s->vtfd;
 }
 
-static int session_vt_fn(sd_event_source *source, const struct signalfd_siginfo *si, void *data) {
-        Session *s = data;
-
-        if (s->vtfd >= 0)
-                ioctl(s->vtfd, VT_RELDISP, 1);
-
-        return 0;
-}
-
-void session_prepare_vt(Session *s) {
+int session_prepare_vt(Session *s) {
         int vt, r;
         struct vt_mode mode = { 0 };
-        sigset_t mask;
+
+        if (s->vtnr < 1)
+                return 0;
 
         vt = session_open_vt(s);
         if (vt < 0)
-                return;
+                return vt;
 
         r = fchown(vt, s->user->uid, -1);
-        if (r < 0)
+        if (r < 0) {
+                r = -errno;
+                log_error("Cannot change owner of /dev/tty%u: %m", s->vtnr);
                 goto error;
+        }
 
         r = ioctl(vt, KDSKBMODE, K_OFF);
-        if (r < 0)
+        if (r < 0) {
+                r = -errno;
+                log_error("Cannot set K_OFF on /dev/tty%u: %m", s->vtnr);
                 goto error;
+        }
 
         r = ioctl(vt, KDSETMODE, KD_GRAPHICS);
-        if (r < 0)
+        if (r < 0) {
+                r = -errno;
+                log_error("Cannot set KD_GRAPHICS on /dev/tty%u: %m", s->vtnr);
                 goto error;
-
-        sigemptyset(&mask);
-        sigaddset(&mask, SIGUSR1);
-        sigprocmask(SIG_BLOCK, &mask, NULL);
-
-        r = sd_event_add_signal(s->manager->event, &s->vt_source, SIGUSR1, session_vt_fn, s);
-        if (r < 0)
-                goto error;
+        }
 
         /* Oh, thanks to the VT layer, VT_AUTO does not work with KD_GRAPHICS.
          * So we need a dummy handler here which just acknowledges *all* VT
          * switch requests. */
         mode.mode = VT_PROCESS;
-        mode.relsig = SIGUSR1;
-        mode.acqsig = SIGUSR1;
+        mode.relsig = SIGRTMIN;
+        mode.acqsig = SIGRTMIN + 1;
         r = ioctl(vt, VT_SETMODE, &mode);
-        if (r < 0)
+        if (r < 0) {
+                r = -errno;
+                log_error("Cannot set VT_PROCESS on /dev/tty%u: %m", s->vtnr);
                 goto error;
+        }
 
-        return;
+        return 0;
 
 error:
-        log_error("cannot mute VT %u for session %s (%d/%d)", s->vtnr, s->id, r, errno);
         session_restore_vt(s);
+        return r;
 }
 
 void session_restore_vt(Session *s) {
@@ -1057,8 +1037,6 @@ void session_restore_vt(Session *s) {
         vt = session_open_vt(s);
         if (vt < 0)
                 return;
-
-        s->vt_source = sd_event_source_unref(s->vt_source);
 
         ioctl(vt, KDSETMODE, KD_TEXT);
 
@@ -1081,30 +1059,30 @@ bool session_is_controller(Session *s, const char *sender) {
         return streq_ptr(s->controller, sender);
 }
 
-static void session_swap_controller(Session *s, char *name) {
+static void session_release_controller(Session *s, bool notify) {
+        _cleanup_free_ char *name = NULL;
         SessionDevice *sd;
 
-        if (s->controller) {
-                manager_drop_busname(s->manager, s->controller);
-                free(s->controller);
+        if (!s->controller)
+                return;
+
+        name = s->controller;
+
+        /* By resetting the controller before releasing the devices, we won't
+         * send notification signals. This avoids sending useless notifications
+         * if the controller is released on disconnects. */
+        if (!notify)
                 s->controller = NULL;
 
-                /* Drop all devices as they're now unused. Do that after the
-                 * controller is released to avoid sending out useles
-                 * dbus signals. */
-                while ((sd = hashmap_first(s->devices)))
-                        session_device_free(sd);
+        while ((sd = hashmap_first(s->devices)))
+                session_device_free(sd);
 
-                if (!name)
-                        session_restore_vt(s);
-        }
-
-        s->controller = name;
-        session_save(s);
+        s->controller = NULL;
+        manager_drop_busname(s->manager, name);
 }
 
 int session_set_controller(Session *s, const char *sender, bool force) {
-        char *t;
+        _cleanup_free_ char *name = NULL;
         int r;
 
         assert(s);
@@ -1115,17 +1093,13 @@ int session_set_controller(Session *s, const char *sender, bool force) {
         if (s->controller && !force)
                 return -EBUSY;
 
-        t = strdup(sender);
-        if (!t)
+        name = strdup(sender);
+        if (!name)
                 return -ENOMEM;
 
-        r = manager_watch_busname(s->manager, sender);
-        if (r) {
-                free(t);
+        r = manager_watch_busname(s->manager, name);
+        if (r)
                 return r;
-        }
-
-        session_swap_controller(s, t);
 
         /* When setting a session controller, we forcibly mute the VT and set
          * it into graphics-mode. Applications can override that by changing
@@ -1135,7 +1109,16 @@ int session_set_controller(Session *s, const char *sender, bool force) {
          * exits.
          * If logind crashes/restarts, we restore the controller during restart
          * or reset the VT in case it crashed/exited, too. */
-        session_prepare_vt(s);
+        r = session_prepare_vt(s);
+        if (r < 0) {
+                manager_drop_busname(s->manager, name);
+                return r;
+        }
+
+        session_release_controller(s, true);
+        s->controller = name;
+        name = NULL;
+        session_save(s);
 
         return 0;
 }
@@ -1146,7 +1129,9 @@ void session_drop_controller(Session *s) {
         if (!s->controller)
                 return;
 
-        session_swap_controller(s, NULL);
+        session_release_controller(s, false);
+        session_save(s);
+        session_restore_vt(s);
 }
 
 static const char* const session_state_table[_SESSION_STATE_MAX] = {
@@ -1164,6 +1149,7 @@ static const char* const session_type_table[_SESSION_TYPE_MAX] = {
         [SESSION_X11] = "x11",
         [SESSION_WAYLAND] = "wayland",
         [SESSION_MIR] = "mir",
+        [SESSION_WEB] = "web",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(session_type, SessionType);

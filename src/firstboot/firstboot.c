@@ -68,7 +68,7 @@ static bool press_any_key(void) {
         printf("-- Press any key to proceed --");
         fflush(stdout);
 
-        read_one_char(stdin, &k, (usec_t) -1, &need_nl);
+        read_one_char(stdin, &k, USEC_INFINITY, &need_nl);
 
         if (need_nl)
                 putchar('\n');
@@ -647,8 +647,7 @@ static int process_root_password(void) {
         return 0;
 }
 
-static int help(void) {
-
+static void help(void) {
         printf("%s [OPTIONS...]\n\n"
                "Configures basic settings of the system.\n\n"
                "  -h --help                    Show this help\n"
@@ -670,10 +669,8 @@ static int help(void) {
                "     --copy-timezone           Copy timezone from host\n"
                "     --copy-root-password      Copy root password from host\n"
                "     --copy                    Copy locale, timezone, root password\n"
-               "     --setup-machine-id        Generate a new random machine ID\n",
-               program_invocation_short_name);
-
-        return 0;
+               "     --setup-machine-id        Generate a new random machine ID\n"
+               , program_invocation_short_name);
 }
 
 static int parse_argv(int argc, char *argv[]) {
@@ -729,12 +726,13 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0) {
+        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
 
                 switch (c) {
 
                 case 'h':
-                        return help();
+                        help();
+                        return 0;
 
                 case ARG_VERSION:
                         puts(PACKAGE_STRING);
@@ -858,6 +856,7 @@ static int parse_argv(int argc, char *argv[]) {
 
                 case ARG_COPY:
                         arg_copy_locale = arg_copy_timezone = arg_copy_root_password = true;
+                        break;
 
                 case ARG_COPY_LOCALE:
                         arg_copy_locale = true;
@@ -887,7 +886,6 @@ static int parse_argv(int argc, char *argv[]) {
                 default:
                         assert_not_reached("Unhandled option");
                 }
-        }
 
         return 1;
 }

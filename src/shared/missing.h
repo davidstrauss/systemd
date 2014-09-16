@@ -64,6 +64,34 @@
 #define F_GETPIPE_SZ (F_LINUX_SPECIFIC_BASE + 8)
 #endif
 
+#ifndef F_ADD_SEALS
+#define F_ADD_SEALS (F_LINUX_SPECIFIC_BASE + 9)
+#endif
+
+#ifndef F_GET_SEALS
+#define F_GET_SEALS (F_LINUX_SPECIFIC_BASE + 10)
+#endif
+
+#ifndef F_SEAL_SEAL
+#define F_SEAL_SEAL     0x0001  /* prevent further seals from being set */
+#endif
+
+#ifndef F_SEAL_SHRINK
+#define F_SEAL_SHRINK   0x0002  /* prevent file from shrinking */
+#endif
+
+#ifndef F_SEAL_GROW
+#define F_SEAL_GROW     0x0004  /* prevent file from growing */
+#endif
+
+#ifndef F_SEAL_WRITE
+#define F_SEAL_WRITE    0x0008  /* prevent writes */
+#endif
+
+#ifndef MFD_ALLOW_SEALING
+#define MFD_ALLOW_SEALING 0x0002ULL
+#endif
+
 #ifndef IP_FREEBIND
 #define IP_FREEBIND 15
 #endif
@@ -109,6 +137,13 @@ static inline int pivot_root(const char *new_root, const char *put_old) {
 #  ifndef __NR_fanotify_mark
 #    define __NR_fanotify_mark 301
 #  endif
+#  ifndef __NR_memfd_create
+#    define __NR_memfd_create 319
+#  endif
+#elif defined __arm__
+#  ifndef __NR_memfd_create
+#    define __NR_memfd_create 385
+#  endif
 #elif defined _MIPS_SIM
 #  if _MIPS_SIM == _MIPS_SIM_ABI32
 #    ifndef __NR_fanotify_init
@@ -132,12 +167,19 @@ static inline int pivot_root(const char *new_root, const char *put_old) {
 #      define __NR_fanotify_mark 5296
 #    endif
 #  endif
+#  ifndef __NR_memfd_create
+#    warning "__NR_memfd_create not yet defined for MIPS"
+#    define __NR_memfd_create 0xffffffff
+#  endif
 #else
 #  ifndef __NR_fanotify_init
 #    define __NR_fanotify_init 338
 #  endif
 #  ifndef __NR_fanotify_mark
 #    define __NR_fanotify_mark 339
+#  endif
+#  ifndef __NR_memfd_create
+#    define __NR_memfd_create 356
 #  endif
 #endif
 
@@ -163,6 +205,12 @@ static inline int fanotify_mark(int fanotify_fd, unsigned int flags, uint64_t ma
 #else
         return syscall(__NR_fanotify_mark, fanotify_fd, flags, mask, dfd, pathname);
 #endif
+}
+#endif
+
+#ifndef HAVE_MEMFD_CREATE
+static inline int memfd_create(const char *name, uint64_t flags) {
+        return syscall(__NR_memfd_create, name, flags);
 }
 #endif
 
@@ -210,7 +258,8 @@ struct btrfs_ioctl_fs_info_args {
 #endif
 
 #ifndef BTRFS_IOC_DEFRAG
-#define BTRFS_IOC_DEFRAG _IOW(BTRFS_IOCTL_MAGIC, 2, struct btrfs_ioctl_vol_args)
+#define BTRFS_IOC_DEFRAG _IOW(BTRFS_IOCTL_MAGIC, 2, \
+                                 struct btrfs_ioctl_vol_args)
 #endif
 
 #ifndef BTRFS_IOC_DEV_INFO
@@ -220,7 +269,12 @@ struct btrfs_ioctl_fs_info_args {
 
 #ifndef BTRFS_IOC_FS_INFO
 #define BTRFS_IOC_FS_INFO _IOR(BTRFS_IOCTL_MAGIC, 31, \
-                               struct btrfs_ioctl_fs_info_args)
+                                 struct btrfs_ioctl_fs_info_args)
+#endif
+
+#ifndef BTRFS_IOC_DEVICES_READY
+#define BTRFS_IOC_DEVICES_READY _IOR(BTRFS_IOCTL_MAGIC, 39, \
+                                 struct btrfs_ioctl_vol_args)
 #endif
 
 #ifndef BTRFS_SUPER_MAGIC
@@ -371,6 +425,27 @@ static inline int setns(int fd, int nstype) {
 #define LOOP_CTL_GET_FREE 0x4C82
 #endif
 
+#if !HAVE_DECL_IFLA_MACVLAN_FLAGS
+#define IFLA_MACVLAN_UNSPEC 0
+#define IFLA_MACVLAN_MODE 1
+#define IFLA_MACVLAN_FLAGS 2
+#define __IFLA_MACVLAN_MAX 3
+
+#define IFLA_MACVLAN_MAX (__IFLA_MACVLAN_MAX - 1)
+#endif
+
+#if !HAVE_DECL_IFLA_VTI_REMOTE
+#define IFLA_VTI_UNSPEC 0
+#define IFLA_VTI_LINK 1
+#define IFLA_VTI_IKEY 2
+#define IFLA_VTI_OKEY 3
+#define IFLA_VTI_LOCAL 4
+#define IFLA_VTI_REMOTE 5
+#define __IFLA_VTI_MAX 6
+
+#define IFLA_VTI_MAX (__IFLA_VTI_MAX - 1)
+#endif
+
 #if !HAVE_DECL_IFLA_PHYS_PORT_ID
 #undef IFLA_PROMISCUITY
 #define IFLA_PROMISCUITY 30
@@ -477,4 +552,52 @@ static inline int setns(int fd, int nstype) {
 #define __IFLA_BRIDGE_MAX 3
 
 #define IFLA_BRIDGE_MAX (__IFLA_BRIDGE_MAX - 1)
+#endif
+
+#ifndef IPV6_UNICAST_IF
+#define IPV6_UNICAST_IF 76
+#endif
+
+#ifndef IFF_MULTI_QUEUE
+#define IFF_MULTI_QUEUE 0x100
+#endif
+
+#ifndef IFF_LOWER_UP
+#define IFF_LOWER_UP 0x10000
+#endif
+
+#ifndef IFF_DORMANT
+#define IFF_DORMANT 0x20000
+#endif
+
+#ifndef BOND_XMIT_POLICY_ENCAP23
+#define BOND_XMIT_POLICY_ENCAP23 3
+#endif
+
+#ifndef BOND_XMIT_POLICY_ENCAP34
+#define BOND_XMIT_POLICY_ENCAP34 4
+#endif
+
+#ifndef NET_ADDR_RANDOM
+#  define NET_ADDR_RANDOM 1
+#endif
+
+#ifndef NET_NAME_ENUM
+#  define NET_NAME_ENUM 1
+#endif
+
+#ifndef NET_NAME_PREDICTABLE
+#  define NET_NAME_PREDICTABLE 2
+#endif
+
+#ifndef NET_NAME_USER
+#  define NET_NAME_USER 3
+#endif
+
+#ifndef NET_NAME_RENAMED
+#  define NET_NAME_RENAMED 4
+#endif
+
+#ifndef BPF_XOR
+#  define BPF_XOR 0xa0
 #endif

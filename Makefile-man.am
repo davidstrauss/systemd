@@ -70,6 +70,8 @@ MANPAGES += \
 	man/systemd-getty-generator.8 \
 	man/systemd-gpt-auto-generator.8 \
 	man/systemd-halt.service.8 \
+	man/systemd-hibernate-resume-generator.8 \
+	man/systemd-hibernate-resume@.service.8 \
 	man/systemd-inhibit.1 \
 	man/systemd-initctl.service.8 \
 	man/systemd-journald.service.8 \
@@ -118,6 +120,7 @@ MANPAGES += \
 	man/telinit.8 \
 	man/tmpfiles.d.5 \
 	man/udev.7 \
+	man/udev.conf.5 \
 	man/udevadm.8
 MANPAGES_ALIAS += \
 	man/SD_ALERT.3 \
@@ -198,6 +201,7 @@ MANPAGES_ALIAS += \
 	man/systemd-firstboot.service.1 \
 	man/systemd-fsck-root.service.8 \
 	man/systemd-fsck.8 \
+	man/systemd-hibernate-resume.8 \
 	man/systemd-hibernate.service.8 \
 	man/systemd-hybrid-sleep.service.8 \
 	man/systemd-initctl.8 \
@@ -304,6 +308,7 @@ man/systemd-ask-password-wall.service.8: man/systemd-ask-password-console.servic
 man/systemd-firstboot.service.1: man/systemd-firstboot.1
 man/systemd-fsck-root.service.8: man/systemd-fsck@.service.8
 man/systemd-fsck.8: man/systemd-fsck@.service.8
+man/systemd-hibernate-resume.8: man/systemd-hibernate-resume@.service.8
 man/systemd-hibernate.service.8: man/systemd-suspend.service.8
 man/systemd-hybrid-sleep.service.8: man/systemd-suspend.service.8
 man/systemd-initctl.8: man/systemd-initctl.service.8
@@ -564,6 +569,9 @@ man/systemd-fsck-root.service.html: man/systemd-fsck@.service.html
 	$(html-alias)
 
 man/systemd-fsck.html: man/systemd-fsck@.service.html
+	$(html-alias)
+
+man/systemd-hibernate-resume.html: man/systemd-hibernate-resume@.service.html
 	$(html-alias)
 
 man/systemd-hibernate.service.html: man/systemd-suspend.service.html
@@ -1198,7 +1206,8 @@ endif
 
 if ENABLE_TIMESYNCD
 MANPAGES += \
-	man/systemd-timesyncd.service.8
+	man/systemd-timesyncd.service.8 \
+	man/timesyncd.conf.5
 MANPAGES_ALIAS += \
 	man/systemd-timesyncd.8
 man/systemd-timesyncd.8: man/systemd-timesyncd.service.8
@@ -1247,7 +1256,8 @@ endif
 if HAVE_MICROHTTPD
 MANPAGES += \
 	man/systemd-journal-gatewayd.service.8 \
-	man/systemd-journal-remote.8
+	man/systemd-journal-remote.8 \
+	man/systemd-journal-upload.8
 MANPAGES_ALIAS += \
 	man/systemd-journal-gatewayd.8 \
 	man/systemd-journal-gatewayd.socket.8
@@ -1616,11 +1626,14 @@ EXTRA_DIST += \
 	man/systemd-getty-generator.xml \
 	man/systemd-gpt-auto-generator.xml \
 	man/systemd-halt.service.xml \
+	man/systemd-hibernate-resume-generator.xml \
+	man/systemd-hibernate-resume@.service.xml \
 	man/systemd-hostnamed.service.xml \
 	man/systemd-inhibit.xml \
 	man/systemd-initctl.service.xml \
 	man/systemd-journal-gatewayd.service.xml \
 	man/systemd-journal-remote.xml \
+	man/systemd-journal-upload.xml \
 	man/systemd-journald.service.xml \
 	man/systemd-localed.service.xml \
 	man/systemd-logind.service.xml \
@@ -1685,7 +1698,9 @@ EXTRA_DIST += \
 	man/sysusers.d.xml \
 	man/telinit.xml \
 	man/timedatectl.xml \
+	man/timesyncd.conf.xml \
 	man/tmpfiles.d.xml \
+	man/udev.conf.xml \
 	man/udev.xml \
 	man/udevadm.xml \
 	man/user-system-options.xml \

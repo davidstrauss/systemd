@@ -34,6 +34,7 @@
 #include "architecture.h"
 #include "env-util.h"
 #include "dbus.h"
+#include "dbus-job.h"
 #include "dbus-manager.h"
 #include "dbus-unit.h"
 #include "dbus-snapshot.h"
@@ -352,6 +353,8 @@ static int method_get_unit(sd_bus *bus, sd_bus_message *message, void *userdata,
         assert(message);
         assert(m);
 
+        /* Anyone can call this method */
+
         r = sd_bus_message_read(message, "s", &name);
         if (r < 0)
                 return r;
@@ -383,6 +386,8 @@ static int method_get_unit_by_pid(sd_bus *bus, sd_bus_message *message, void *us
         assert(m);
 
         assert_cc(sizeof(pid_t) == sizeof(uint32_t));
+
+        /* Anyone can call this method */
 
         r = sd_bus_message_read(message, "u", &pid);
         if (r < 0)
@@ -426,6 +431,8 @@ static int method_load_unit(sd_bus *bus, sd_bus_message *message, void *userdata
         assert(message);
         assert(m);
 
+        /* Anyone can call this method */
+
         r = sd_bus_message_read(message, "s", &name);
         if (r < 0)
                 return r;
@@ -453,6 +460,12 @@ static int method_start_unit_generic(sd_bus *bus, sd_bus_message *message, Manag
         assert(bus);
         assert(message);
         assert(m);
+
+        r = bus_verify_manage_unit_async(m, message, error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
 
         r = sd_bus_message_read(message, "s", &name);
         if (r < 0)
@@ -503,6 +516,12 @@ static int method_start_unit_replace(sd_bus *bus, sd_bus_message *message, void 
         assert(message);
         assert(m);
 
+        r = bus_verify_manage_unit_async(m, message, error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
+
         r = sd_bus_message_read(message, "s", &old_name);
         if (r < 0)
                 return r;
@@ -523,6 +542,13 @@ static int method_kill_unit(sd_bus *bus, sd_bus_message *message, void *userdata
         assert(bus);
         assert(message);
         assert(m);
+
+        /* Like bus_verify_manage_unit_async(), but uses CAP_SYS_KILL */
+        r = bus_verify_manage_unit_async_for_kill(m, message, error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
 
         r = sd_bus_message_read(message, "s", &name);
         if (r < 0)
@@ -545,6 +571,12 @@ static int method_reset_failed_unit(sd_bus *bus, sd_bus_message *message, void *
         assert(message);
         assert(m);
 
+        r = bus_verify_manage_unit_async(m, message, error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
+
         r = sd_bus_message_read(message, "s", &name);
         if (r < 0)
                 return r;
@@ -565,6 +597,12 @@ static int method_set_unit_properties(sd_bus *bus, sd_bus_message *message, void
         assert(bus);
         assert(message);
         assert(m);
+
+        r = bus_verify_manage_unit_async(m, message, error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
 
         r = sd_bus_message_read(message, "s", &name);
         if (r < 0)
@@ -588,6 +626,12 @@ static int method_start_transient_unit(sd_bus *bus, sd_bus_message *message, voi
         assert(bus);
         assert(message);
         assert(m);
+
+        r = bus_verify_manage_unit_async(m, message, error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
 
         r = sd_bus_message_read(message, "ss", &name, &smode);
         if (r < 0)
@@ -648,6 +692,8 @@ static int method_get_job(sd_bus *bus, sd_bus_message *message, void *userdata, 
         assert(message);
         assert(m);
 
+        /* Anyone can call this method */
+
         r = sd_bus_message_read(message, "u", &id);
         if (r < 0)
                 return r;
@@ -685,13 +731,7 @@ static int method_cancel_job(sd_bus *bus, sd_bus_message *message, void *userdat
         if (!j)
                 return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_JOB, "Job %u does not exist.", (unsigned) id);
 
-        r = selinux_unit_access_check(j->unit, message, "stop", error);
-        if (r < 0)
-                return r;
-
-        job_finish_and_invalidate(j, JOB_CANCELED, true);
-
-        return sd_bus_reply_method_return(message, NULL);
+        return bus_job_method_cancel(bus, message, j, error);
 }
 
 static int method_clear_jobs(sd_bus *bus, sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -739,6 +779,8 @@ static int list_units_filtered(sd_bus *bus, sd_bus_message *message, void *userd
         assert(bus);
         assert(message);
         assert(m);
+
+        /* Anyone can call this method */
 
         r = selinux_access_check(message, "status", error);
         if (r < 0)
@@ -826,6 +868,8 @@ static int method_list_jobs(sd_bus *bus, sd_bus_message *message, void *userdata
         assert(message);
         assert(m);
 
+        /* Anyone can call this method */
+
         r = selinux_access_check(message, "status", error);
         if (r < 0)
                 return r;
@@ -876,6 +920,8 @@ static int method_subscribe(sd_bus *bus, sd_bus_message *message, void *userdata
         assert(message);
         assert(m);
 
+        /* Anyone can call this method */
+
         r = selinux_access_check(message, "status", error);
         if (r < 0)
                 return r;
@@ -909,6 +955,8 @@ static int method_unsubscribe(sd_bus *bus, sd_bus_message *message, void *userda
         assert(message);
         assert(m);
 
+        /* Anyone can call this method */
+
         r = selinux_access_check(message, "status", error);
         if (r < 0)
                 return r;
@@ -934,6 +982,8 @@ static int method_dump(sd_bus *bus, sd_bus_message *message, void *userdata, sd_
         assert(bus);
         assert(message);
         assert(m);
+
+        /* Anyone can call this method */
 
         r = selinux_access_check(message, "status", error);
         if (r < 0)
@@ -1024,6 +1074,12 @@ static int method_reload(sd_bus *bus, sd_bus_message *message, void *userdata, s
         assert(message);
         assert(m);
 
+        r = bus_verify_reload_daemon_async(m, message, error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
+
         r = selinux_access_check(message, "reload", error);
         if (r < 0)
                 return r;
@@ -1051,6 +1107,12 @@ static int method_reexecute(sd_bus *bus, sd_bus_message *message, void *userdata
         assert(bus);
         assert(message);
         assert(m);
+
+        r = bus_verify_reload_daemon_async(m, message, error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
 
         r = selinux_access_check(message, "reload", error);
         if (r < 0)
@@ -1179,7 +1241,7 @@ static int method_switch_root(sd_bus *bus, sd_bus_message *message, void *userda
                 return r;
 
         if (m->running_as != SYSTEMD_SYSTEM)
-                return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED, "KExec is only supported for system managers.");
+                return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED, "Root switching is only supported by system manager.");
 
         r = sd_bus_message_read(message, "ss", &root, &init);
         if (r < 0)
@@ -1190,7 +1252,7 @@ static int method_switch_root(sd_bus *bus, sd_bus_message *message, void *userda
 
         /* Safety check */
         if (isempty(init)) {
-                if (! path_is_os_tree(root))
+                if (!path_is_os_tree(root))
                         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Specified switch root path %s does not seem to be an OS tree. os-release file is missing.", root);
         } else {
                 _cleanup_free_ char *p = NULL;
@@ -1295,18 +1357,18 @@ static int method_unset_and_set_environment(sd_bus *bus, sd_bus_message *message
         if (r < 0)
                 return r;
 
-        r = sd_bus_message_read_strv(message, &plus);
-        if (r < 0)
-                return r;
-
         r = sd_bus_message_read_strv(message, &minus);
         if (r < 0)
                 return r;
 
-        if (!strv_env_is_valid(plus))
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid environment assignments");
+        r = sd_bus_message_read_strv(message, &plus);
+        if (r < 0)
+                return r;
+
         if (!strv_env_name_or_assignment_is_valid(minus))
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid environment variable names or assignments");
+        if (!strv_env_is_valid(plus))
+                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid environment assignments");
 
         r = manager_environment_add(m, minus, plus);
         if (r < 0)
@@ -1326,6 +1388,8 @@ static int method_list_unit_files(sd_bus *bus, sd_bus_message *message, void *us
         assert(bus);
         assert(message);
         assert(m);
+
+        /* Anyone can call this method */
 
         r = selinux_access_check(message, "status", error);
         if (r < 0)
@@ -1378,6 +1442,8 @@ static int method_get_unit_file_state(sd_bus *bus, sd_bus_message *message, void
         assert(message);
         assert(m);
 
+        /* Anyone can call this method */
+
         r = selinux_access_check(message, "status", error);
         if (r < 0)
                 return r;
@@ -1404,6 +1470,8 @@ static int method_get_default_target(sd_bus *bus, sd_bus_message *message, void 
         assert(bus);
         assert(message);
         assert(m);
+
+        /* Anyone can call this method */
 
         r = selinux_access_check(message, "status", error);
         if (r < 0)
@@ -1506,6 +1574,12 @@ static int method_enable_unit_files_generic(
         assert(message);
         assert(m);
 
+        r = bus_verify_manage_unit_files_async(m, message, error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
+
         r = sd_bus_message_read_strv(message, &l);
         if (r < 0)
                 return r;
@@ -1578,6 +1652,12 @@ static int method_preset_unit_files_with_mode(sd_bus *bus, sd_bus_message *messa
         assert(message);
         assert(m);
 
+        r = bus_verify_manage_unit_files_async(m, message, error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
+
         r = sd_bus_message_read_strv(message, &l);
         if (r < 0)
                 return r;
@@ -1634,6 +1714,12 @@ static int method_disable_unit_files_generic(
         assert(message);
         assert(m);
 
+        r = bus_verify_manage_unit_files_async(m, message, error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
+
         r = selinux_access_check(message, verb, error);
         if (r < 0)
                 return r;
@@ -1675,6 +1761,12 @@ static int method_set_default_target(sd_bus *bus, sd_bus_message *message, void 
         assert(message);
         assert(m);
 
+        r = bus_verify_manage_unit_files_async(m, message, error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
+
         r = selinux_access_check(message, "enable", error);
         if (r < 0)
                 return r;
@@ -1704,6 +1796,12 @@ static int method_preset_all_unit_files(sd_bus *bus, sd_bus_message *message, vo
         assert(bus);
         assert(message);
         assert(m);
+
+        r = bus_verify_manage_unit_files_async(m, message, error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
 
         r = selinux_access_check(message, "enable", error);
         if (r < 0)
@@ -1772,20 +1870,20 @@ const sd_bus_vtable bus_manager_vtable[] = {
         SD_BUS_METHOD("GetUnit", "s", "o", method_get_unit, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("GetUnitByPID", "u", "o", method_get_unit_by_pid, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("LoadUnit", "s", "o", method_load_unit, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("StartUnit", "ss", "o", method_start_unit, 0),
-        SD_BUS_METHOD("StartUnitReplace", "sss", "o", method_start_unit_replace, 0),
-        SD_BUS_METHOD("StopUnit", "ss", "o", method_stop_unit, 0),
-        SD_BUS_METHOD("ReloadUnit", "ss", "o", method_reload_unit, 0),
-        SD_BUS_METHOD("RestartUnit", "ss", "o", method_restart_unit, 0),
-        SD_BUS_METHOD("TryRestartUnit", "ss", "o", method_try_restart_unit, 0),
-        SD_BUS_METHOD("ReloadOrRestartUnit", "ss", "o", method_reload_or_restart_unit, 0),
-        SD_BUS_METHOD("ReloadOrTryRestartUnit", "ss", "o", method_reload_or_try_restart_unit, 0),
-        SD_BUS_METHOD("KillUnit", "ssi", NULL, method_kill_unit, SD_BUS_VTABLE_CAPABILITY(CAP_KILL)),
-        SD_BUS_METHOD("ResetFailedUnit", "s", NULL, method_reset_failed_unit, 0),
-        SD_BUS_METHOD("SetUnitProperties", "sba(sv)", NULL, method_set_unit_properties, 0),
-        SD_BUS_METHOD("StartTransientUnit", "ssa(sv)a(sa(sv))", "o", method_start_transient_unit, 0),
+        SD_BUS_METHOD("StartUnit", "ss", "o", method_start_unit, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("StartUnitReplace", "sss", "o", method_start_unit_replace, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("StopUnit", "ss", "o", method_stop_unit, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("ReloadUnit", "ss", "o", method_reload_unit, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("RestartUnit", "ss", "o", method_restart_unit, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("TryRestartUnit", "ss", "o", method_try_restart_unit, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("ReloadOrRestartUnit", "ss", "o", method_reload_or_restart_unit, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("ReloadOrTryRestartUnit", "ss", "o", method_reload_or_try_restart_unit, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("KillUnit", "ssi", NULL, method_kill_unit, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("ResetFailedUnit", "s", NULL, method_reset_failed_unit, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("SetUnitProperties", "sba(sv)", NULL, method_set_unit_properties, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("StartTransientUnit", "ssa(sv)a(sa(sv))", "o", method_start_transient_unit, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("GetJob", "u", "o", method_get_job, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("CancelJob", "u", NULL, method_cancel_job, 0),
+        SD_BUS_METHOD("CancelJob", "u", NULL, method_cancel_job, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("ClearJobs", NULL, NULL, method_clear_jobs, 0),
         SD_BUS_METHOD("ResetFailed", NULL, NULL, method_reset_failed, 0),
         SD_BUS_METHOD("ListUnits", NULL, "a(ssssssouso)", method_list_units, SD_BUS_VTABLE_UNPRIVILEGED),
@@ -1796,8 +1894,8 @@ const sd_bus_vtable bus_manager_vtable[] = {
         SD_BUS_METHOD("Dump", NULL, "s", method_dump, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("CreateSnapshot", "sb", "o", method_create_snapshot, 0),
         SD_BUS_METHOD("RemoveSnapshot", "s", NULL, method_remove_snapshot, 0),
-        SD_BUS_METHOD("Reload", NULL, NULL, method_reload, 0),
-        SD_BUS_METHOD("Reexecute", NULL, NULL, method_reexecute, 0),
+        SD_BUS_METHOD("Reload", NULL, NULL, method_reload, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("Reexecute", NULL, NULL, method_reexecute, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("Exit", NULL, NULL, method_exit, 0),
         SD_BUS_METHOD("Reboot", NULL, NULL, method_reboot, SD_BUS_VTABLE_CAPABILITY(CAP_SYS_BOOT)),
         SD_BUS_METHOD("PowerOff", NULL, NULL, method_poweroff, SD_BUS_VTABLE_CAPABILITY(CAP_SYS_BOOT)),
@@ -1809,17 +1907,17 @@ const sd_bus_vtable bus_manager_vtable[] = {
         SD_BUS_METHOD("UnsetAndSetEnvironment", "asas", NULL, method_unset_and_set_environment, 0),
         SD_BUS_METHOD("ListUnitFiles", NULL, "a(ss)", method_list_unit_files, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("GetUnitFileState", "s", "s", method_get_unit_file_state, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("EnableUnitFiles", "asbb", "ba(sss)", method_enable_unit_files, 0),
-        SD_BUS_METHOD("DisableUnitFiles", "asb", "a(sss)", method_disable_unit_files, 0),
-        SD_BUS_METHOD("ReenableUnitFiles", "asbb", "ba(sss)", method_reenable_unit_files, 0),
-        SD_BUS_METHOD("LinkUnitFiles", "asbb", "a(sss)", method_link_unit_files, 0),
-        SD_BUS_METHOD("PresetUnitFiles", "asbb", "ba(sss)", method_preset_unit_files, 0),
-        SD_BUS_METHOD("PresetUnitFilesWithMode", "assbb", "ba(sss)", method_preset_unit_files_with_mode, 0),
-        SD_BUS_METHOD("MaskUnitFiles", "asbb", "a(sss)", method_mask_unit_files, 0),
-        SD_BUS_METHOD("UnmaskUnitFiles", "asb", "a(sss)", method_unmask_unit_files, 0),
-        SD_BUS_METHOD("SetDefaultTarget", "sb", "a(sss)", method_set_default_target, 0),
+        SD_BUS_METHOD("EnableUnitFiles", "asbb", "ba(sss)", method_enable_unit_files, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("DisableUnitFiles", "asb", "a(sss)", method_disable_unit_files, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("ReenableUnitFiles", "asbb", "ba(sss)", method_reenable_unit_files, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("LinkUnitFiles", "asbb", "a(sss)", method_link_unit_files, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("PresetUnitFiles", "asbb", "ba(sss)", method_preset_unit_files, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("PresetUnitFilesWithMode", "assbb", "ba(sss)", method_preset_unit_files_with_mode, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("MaskUnitFiles", "asbb", "a(sss)", method_mask_unit_files, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("UnmaskUnitFiles", "asb", "a(sss)", method_unmask_unit_files, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("SetDefaultTarget", "sb", "a(sss)", method_set_default_target, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("GetDefaultTarget", NULL, "s", method_get_default_target, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("PresetAllUnitFiles", "sbb", "a(sss)", method_preset_all_unit_files, 0),
+        SD_BUS_METHOD("PresetAllUnitFiles", "sbb", "a(sss)", method_preset_all_unit_files, SD_BUS_VTABLE_UNPRIVILEGED),
 
         SD_BUS_SIGNAL("UnitNew", "so", 0),
         SD_BUS_SIGNAL("UnitRemoved", "so", 0),

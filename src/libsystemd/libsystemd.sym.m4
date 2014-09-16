@@ -150,7 +150,7 @@ global:
 
 LIBSYSTEMD_216 {
 global:
-        sd_machine_get_ifindexes;
+        sd_machine_get_ifindices;
 } LIBSYSTEMD_214;
 
 m4_ifdef(`ENABLE_KDBUS',
@@ -359,20 +359,6 @@ global:
         sd_bus_track_first;
         sd_bus_track_next;
 
-        /* sd-memfd */
-        sd_memfd_new;
-        sd_memfd_new_and_map;
-        sd_memfd_free;
-        sd_memfd_get_fd;
-        sd_memfd_get_file;
-        sd_memfd_dup_fd;
-        sd_memfd_map;
-        sd_memfd_set_sealed;
-        sd_memfd_get_sealed;
-        sd_memfd_get_size;
-        sd_memfd_set_size;
-        sd_memfd_get_name;
-
         /* sd-event */
         sd_event_default;
         sd_event_new;
@@ -388,6 +374,7 @@ global:
         sd_event_loop;
         sd_event_exit;
         sd_event_now;
+        sd_event_get_fd;
         sd_event_get_state;
         sd_event_get_tid;
         sd_event_get_exit_code;
@@ -395,6 +382,8 @@ global:
         sd_event_get_watchdog;
         sd_event_source_ref;
         sd_event_source_unref;
+        sd_event_source_set_name;
+        sd_event_source_get_name;
         sd_event_source_set_prepare;
         sd_event_source_get_pending;
         sd_event_source_get_priority;

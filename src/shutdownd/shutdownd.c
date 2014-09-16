@@ -30,8 +30,8 @@
 #include <fcntl.h>
 #include <stddef.h>
 
-#include <systemd/sd-daemon.h>
-#include <systemd/sd-shutdown.h>
+#include "systemd/sd-daemon.h"
+#include "systemd/sd-shutdown.h"
 
 #include "log.h"
 #include "macro.h"
@@ -456,6 +456,7 @@ finish:
         }
 
         sd_notify(false,
+                  "STOPPING=\n"
                   "STATUS=Exiting...");
 
         return r;

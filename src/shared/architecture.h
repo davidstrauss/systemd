@@ -28,7 +28,7 @@
 /* A cleaned up architecture definition. We don't want to get lost in
  * processor features, models, generations or even ABIs. Hence we
  * focus on general family, and distuignish word width and
- * endianess. */
+ * endianness. */
 
 typedef enum Architecture {
         ARCHITECTURE_X86 = 0,
@@ -87,7 +87,7 @@ Architecture uname_architecture(void);
 #    define LIB_ARCH_TUPLE "ppc64-linux-gnu"
 #  else
 #    define native_architecture() ARCHITECTURE_PPC64_LE
-#    error "Missing LIB_ARCH_TUPLE for PPC64LE"
+#    define LIB_ARCH_TUPLE  "powerpc64le-linux-gnu"
 #  endif
 #elif defined(__powerpc__)
 #  if __BYTE_ORDER == __BIG_ENDIAN

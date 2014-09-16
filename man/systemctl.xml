@@ -60,10 +60,12 @@ along with systemd; If not, see <http://www.gnu.org/licenses/>.
   <refsect1>
     <title>Description</title>
 
-    <para><command>systemctl</command> may be used to
-    introspect and control the state of the
+    <para><command>systemctl</command> may be used to introspect and
+    control the state of the <literal>systemd</literal> system and
+    service manager. Please refer to
     <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-    system and service manager.</para>
+    for an introduction into the basic concepts and functionality this
+    tool manages.</para>
   </refsect1>
 
   <refsect1>
@@ -637,8 +639,7 @@ kobject-uevent 1 systemd-udevd-kernel.socket systemd-udevd.service
             file.</para>
 
             <para>This command should not be confused with the
-            <command>daemon-reload</command> or <command>load</command>
-            commands.</para>
+            <command>daemon-reload</command> command.</para>
           </listitem>
 
         </varlistentry>
@@ -1274,10 +1275,9 @@ kobject-uevent 1 systemd-udevd-kernel.socket systemd-udevd.service
             <para>Reload systemd manager configuration. This will reload
             all unit files and recreate the entire dependency
             tree. While the daemon is being reloaded, all sockets systemd
-            listens on on behalf of user configuration will stay
+            listens on behalf of user configuration will stay
             accessible.</para> <para>This command should not be confused
-            with the <command>load</command> or
-            <command>reload</command> commands.</para>
+            with the <command>reload</command> command.</para>
           </listitem>
         </varlistentry>
         <varlistentry>
@@ -1307,7 +1307,7 @@ kobject-uevent 1 systemd-udevd-kernel.socket systemd-udevd.service
           <listitem>
             <para>Checks whether the system is running. This returns
             success when the system is fully up and running, meaning
-            not in startup, shutdown or maintainance mode. Failure is
+            not in startup, shutdown or maintenance mode. Failure is
             returned otherwise. In addition, the current state is
             printed in a short string to standard output. Use
             <option>--quiet</option> to suppress output of this state

@@ -22,6 +22,7 @@
 #include <time.h>
 #include <string.h>
 #include <sys/timex.h>
+#include <sys/timerfd.h>
 
 #include "util.h"
 #include "time-util.h"
@@ -48,8 +49,8 @@ dual_timestamp* dual_timestamp_from_realtime(dual_timestamp *ts, usec_t u) {
         int64_t delta;
         assert(ts);
 
-        if (u == (usec_t) -1) {
-                ts->realtime = ts->monotonic = (usec_t) -1;
+        if (u == USEC_INFINITY) {
+                ts->realtime = ts->monotonic = USEC_INFINITY;
                 return ts;
         }
 
@@ -75,8 +76,8 @@ dual_timestamp* dual_timestamp_from_monotonic(dual_timestamp *ts, usec_t u) {
         int64_t delta;
         assert(ts);
 
-        if (u == (usec_t) -1) {
-                ts->realtime = ts->monotonic = (usec_t) -1;
+        if (u == USEC_INFINITY) {
+                ts->realtime = ts->monotonic = USEC_INFINITY;
                 return ts;
         }
 
@@ -97,10 +98,10 @@ usec_t timespec_load(const struct timespec *ts) {
 
         if (ts->tv_sec == (time_t) -1 &&
             ts->tv_nsec == (long) -1)
-                return (usec_t) -1;
+                return USEC_INFINITY;
 
         if ((usec_t) ts->tv_sec > (UINT64_MAX - (ts->tv_nsec / NSEC_PER_USEC)) / USEC_PER_SEC)
-                return (usec_t) -1;
+                return USEC_INFINITY;
 
         return
                 (usec_t) ts->tv_sec * USEC_PER_SEC +
@@ -110,7 +111,7 @@ usec_t timespec_load(const struct timespec *ts) {
 struct timespec *timespec_store(struct timespec *ts, usec_t u)  {
         assert(ts);
 
-        if (u == (usec_t) -1) {
+        if (u == USEC_INFINITY) {
                 ts->tv_sec = (time_t) -1;
                 ts->tv_nsec = (long) -1;
                 return ts;
@@ -127,10 +128,10 @@ usec_t timeval_load(const struct timeval *tv) {
 
         if (tv->tv_sec == (time_t) -1 &&
             tv->tv_usec == (suseconds_t) -1)
-                return (usec_t) -1;
+                return USEC_INFINITY;
 
         if ((usec_t) tv->tv_sec > (UINT64_MAX - tv->tv_usec) / USEC_PER_SEC)
-                return (usec_t) -1;
+                return USEC_INFINITY;
 
         return
                 (usec_t) tv->tv_sec * USEC_PER_SEC +
@@ -140,7 +141,7 @@ usec_t timeval_load(const struct timeval *tv) {
 struct timeval *timeval_store(struct timeval *tv, usec_t u) {
         assert(tv);
 
-        if (u == (usec_t) -1) {
+        if (u == USEC_INFINITY) {
                 tv->tv_sec = (time_t) -1;
                 tv->tv_usec = (suseconds_t) -1;
         } else {
@@ -158,7 +159,7 @@ char *format_timestamp(char *buf, size_t l, usec_t t) {
         assert(buf);
         assert(l > 0);
 
-        if (t <= 0 || t == (usec_t) -1)
+        if (t <= 0 || t == USEC_INFINITY)
                 return NULL;
 
         sec = (time_t) (t / USEC_PER_SEC);
@@ -176,7 +177,7 @@ char *format_timestamp_us(char *buf, size_t l, usec_t t) {
         assert(buf);
         assert(l > 0);
 
-        if (t <= 0 || t == (usec_t) -1)
+        if (t <= 0 || t == USEC_INFINITY)
                 return NULL;
 
         sec = (time_t) (t / USEC_PER_SEC);
@@ -197,7 +198,7 @@ char *format_timestamp_relative(char *buf, size_t l, usec_t t) {
 
         n = now(CLOCK_REALTIME);
 
-        if (t <= 0 || (t == (usec_t) -1))
+        if (t <= 0 || (t == USEC_INFINITY))
                 return NULL;
 
         if (n > t) {
@@ -278,7 +279,7 @@ char *format_timespan(char *buf, size_t l, usec_t t, usec_t accuracy) {
         assert(buf);
         assert(l > 0);
 
-        if (t == (usec_t) -1)
+        if (t == USEC_INFINITY)
                 return NULL;
 
         if (t <= 0) {
@@ -928,4 +929,22 @@ bool timezone_is_valid(const char *name) {
                 return false;
 
         return true;
+}
+
+clockid_t clock_boottime_or_monotonic(void) {
+        static clockid_t clock = -1;
+        int fd;
+
+        if (clock != -1)
+                return clock;
+
+        fd = timerfd_create(CLOCK_BOOTTIME, TFD_NONBLOCK|TFD_CLOEXEC);
+        if (fd < 0)
+                clock = CLOCK_MONOTONIC;
+        else {
+                safe_close(fd);
+                clock = CLOCK_BOOTTIME;
+        }
+
+        return clock;
 }

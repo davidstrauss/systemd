@@ -35,11 +35,6 @@
 #include "nss-util.h"
 #include "util.h"
 
-/* Ensure that glibc's assert is used. We cannot use assert from macro.h, as
- * libnss_myhostname will be linked into arbitrary programs which will, in turn
- * attempt to write to the journal via log_dispatch() */
-#include <assert.h>
-
 /* We use 127.0.0.2 as IPv4 address. This has the advantage over
  * 127.0.0.1 that it can be translated back to the local hostname. For
  * IPv6 we use ::1 which unfortunately will not translate back to the
@@ -97,7 +92,7 @@ enum nss_status _nss_myhostname_gethostbyname4_r(
                         return NSS_STATUS_NOTFOUND;
                 }
 
-                n_addresses = local_addresses(&addresses);
+                n_addresses = local_addresses(NULL, 0, &addresses);
                 if (n_addresses < 0)
                         n_addresses = 0;
 
@@ -170,6 +165,11 @@ enum nss_status _nss_myhostname_gethostbyname4_r(
         if (ttlp)
                 *ttlp = 0;
 
+        /* Explicitly reset all error variables */
+        *errnop = 0;
+        *h_errnop = NETDB_SUCCESS;
+        h_errno = 0;
+
         return NSS_STATUS_SUCCESS;
 }
 
@@ -195,7 +195,7 @@ static enum nss_status fill_in_hostent(
         assert(errnop);
         assert(h_errnop);
 
-        alen = PROTO_ADDRESS_SIZE(af);
+        alen = FAMILY_ADDRESS_SIZE(af);
 
         for (a = addresses, n = 0, c = 0; n < n_addresses; a++, n++)
                 if (af == a->family)
@@ -294,6 +294,11 @@ static enum nss_status fill_in_hostent(
         if (canonp)
                 *canonp = r_name;
 
+        /* Explicitly reset all error variables */
+        *errnop = 0;
+        *h_errnop = NETDB_SUCCESS;
+        h_errno = 0;
+
         return NSS_STATUS_SUCCESS;
 }
 
@@ -344,7 +349,7 @@ enum nss_status _nss_myhostname_gethostbyname3_r(
                         return NSS_STATUS_NOTFOUND;
                 }
 
-                n_addresses = local_addresses(&addresses);
+                n_addresses = local_addresses(NULL, 0, &addresses);
                 if (n_addresses < 0)
                         n_addresses = 0;
 
@@ -387,7 +392,13 @@ enum nss_status _nss_myhostname_gethostbyaddr2_r(
         assert(errnop);
         assert(h_errnop);
 
-        if (len != PROTO_ADDRESS_SIZE(af)) {
+        if (!IN_SET(af, AF_INET, AF_INET6)) {
+                *errnop = EAFNOSUPPORT;
+                *h_errnop = NO_DATA;
+                return NSS_STATUS_UNAVAIL;
+        }
+
+        if (len != FAMILY_ADDRESS_SIZE(af)) {
                 *errnop = EINVAL;
                 *h_errnop = NO_RECOVERY;
                 return NSS_STATUS_UNAVAIL;
@@ -404,20 +415,17 @@ enum nss_status _nss_myhostname_gethostbyaddr2_r(
                         goto found;
                 }
 
-        } else if (af == AF_INET6) {
+        } else {
+                assert(af == AF_INET6);
 
                 if (memcmp(addr, LOCALADDRESS_IPV6, 16) == 0) {
                         additional = "localhost";
                         goto found;
                 }
 
-        } else {
-                *errnop = EAFNOSUPPORT;
-                *h_errnop = NO_DATA;
-                return NSS_STATUS_UNAVAIL;
         }
 
-        n_addresses = local_addresses(&addresses);
+        n_addresses = local_addresses(NULL, 0, &addresses);
         if (n_addresses < 0)
                 n_addresses = 0;
 
@@ -425,7 +433,7 @@ enum nss_status _nss_myhostname_gethostbyaddr2_r(
                 if (af != a->family)
                         continue;
 
-                if (memcmp(addr, &a->address, PROTO_ADDRESS_SIZE(af)) == 0)
+                if (memcmp(addr, &a->address, FAMILY_ADDRESS_SIZE(af)) == 0)
                         goto found;
         }
 

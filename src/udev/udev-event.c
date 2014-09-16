@@ -34,8 +34,7 @@
 #include "udev.h"
 #include "rtnl-util.h"
 
-struct udev_event *udev_event_new(struct udev_device *dev)
-{
+struct udev_event *udev_event_new(struct udev_device *dev) {
         struct udev *udev = udev_device_get_udev(dev);
         struct udev_event *event;
 
@@ -48,14 +47,13 @@ struct udev_event *udev_event_new(struct udev_device *dev)
         udev_list_init(udev, &event->seclabel_list, false);
         event->fd_signal = -1;
         event->birth_usec = now(CLOCK_MONOTONIC);
-        event->timeout_usec = 30 * 1000 * 1000;
         return event;
 }
 
-void udev_event_unref(struct udev_event *event)
-{
+void udev_event_unref(struct udev_event *event) {
         if (event == NULL)
                 return;
+        sd_rtnl_unref(event->rtnl);
         udev_list_cleanup(&event->run_list);
         udev_list_cleanup(&event->seclabel_list);
         free(event->program_result);
@@ -63,8 +61,7 @@ void udev_event_unref(struct udev_event *event)
         free(event);
 }
 
-size_t udev_event_apply_format(struct udev_event *event, const char *src, char *dest, size_t size)
-{
+size_t udev_event_apply_format(struct udev_event *event, const char *src, char *dest, size_t size) {
         struct udev_device *dev = event->dev;
         enum subst_type {
                 SUBST_UNKNOWN,
@@ -378,8 +375,7 @@ out:
 
 static int spawn_exec(struct udev_event *event,
                       const char *cmd, char *const argv[], char **envp, const sigset_t *sigmask,
-                      int fd_stdout, int fd_stderr)
-{
+                      int fd_stdout, int fd_stderr) {
         int err;
         int fd;
 
@@ -422,10 +418,10 @@ static int spawn_exec(struct udev_event *event,
 }
 
 static void spawn_read(struct udev_event *event,
-                      const char *cmd,
-                      int fd_stdout, int fd_stderr,
-                      char *result, size_t ressize)
-{
+                       usec_t timeout_usec,
+                       const char *cmd,
+                       int fd_stdout, int fd_stderr,
+                       char *result, size_t ressize) {
         size_t respos = 0;
         int fd_ep = -1;
         struct epoll_event ep_outpipe, ep_errpipe;
@@ -467,15 +463,15 @@ static void spawn_read(struct udev_event *event,
                 struct epoll_event ev[4];
                 int i;
 
-                if (event->timeout_usec > 0) {
+                if (timeout_usec > 0) {
                         usec_t age_usec;
 
                         age_usec = now(CLOCK_MONOTONIC) - event->birth_usec;
-                        if (age_usec >= event->timeout_usec) {
+                        if (age_usec >= timeout_usec) {
                                 log_error("timeout '%s'", cmd);
                                 goto out;
                         }
-                        timeout = ((event->timeout_usec - age_usec) / 1000) + 1000;
+                        timeout = ((timeout_usec - age_usec) / USEC_PER_MSEC) + MSEC_PER_SEC;
                 } else {
                         timeout = -1;
                 }
@@ -543,8 +539,10 @@ out:
                 close(fd_ep);
 }
 
-static int spawn_wait(struct udev_event *event, const char *cmd, pid_t pid)
-{
+static int spawn_wait(struct udev_event *event,
+                      usec_t timeout_usec,
+                      usec_t timeout_warn_usec,
+                      const char *cmd, pid_t pid) {
         struct pollfd pfd[1];
         int err = 0;
 
@@ -553,21 +551,26 @@ static int spawn_wait(struct udev_event *event, const char *cmd, pid_t pid)
 
         while (pid > 0) {
                 int timeout;
+                int timeout_warn = 0;
                 int fdcount;
 
-                if (event->timeout_usec > 0) {
+                if (timeout_usec > 0) {
                         usec_t age_usec;
 
                         age_usec = now(CLOCK_MONOTONIC) - event->birth_usec;
-                        if (age_usec >= event->timeout_usec)
+                        if (age_usec >= timeout_usec)
                                 timeout = 1000;
-                        else
-                                timeout = ((event->timeout_usec - age_usec) / 1000) + 1000;
+                        else {
+                                if (timeout_warn_usec > 0)
+                                        timeout_warn = ((timeout_warn_usec - age_usec) / USEC_PER_MSEC) + MSEC_PER_SEC;
+
+                                timeout = ((timeout_usec - timeout_warn_usec - age_usec) / USEC_PER_MSEC) + MSEC_PER_SEC;
+                        }
                 } else {
                         timeout = -1;
                 }
 
-                fdcount = poll(pfd, 1, timeout);
+                fdcount = poll(pfd, 1, timeout_warn);
                 if (fdcount < 0) {
                         if (errno == EINTR)
                                 continue;
@@ -576,8 +579,20 @@ static int spawn_wait(struct udev_event *event, const char *cmd, pid_t pid)
                         goto out;
                 }
                 if (fdcount == 0) {
-                        log_error("timeout: killing '%s' [%u]", cmd, pid);
-                        kill(pid, SIGKILL);
+                        log_warning("slow: '%s' [%u]", cmd, pid);
+
+                        fdcount = poll(pfd, 1, timeout);
+                        if (fdcount < 0) {
+                                if (errno == EINTR)
+                                        continue;
+                                err = -errno;
+                                log_error("failed to poll: %m");
+                                goto out;
+                        }
+                        if (fdcount == 0) {
+                                log_error("timeout: killing '%s' [%u]", cmd, pid);
+                                kill(pid, SIGKILL);
+                        }
                 }
 
                 if (pfd[0].revents & POLLIN) {
@@ -622,8 +637,7 @@ out:
         return err;
 }
 
-int udev_build_argv(struct udev *udev, char *cmd, int *argc, char *argv[])
-{
+int udev_build_argv(struct udev *udev, char *cmd, int *argc, char *argv[]) {
         int i = 0;
         char *pos;
 
@@ -657,9 +671,10 @@ out:
 }
 
 int udev_event_spawn(struct udev_event *event,
+                     usec_t timeout_usec,
+                     usec_t timeout_warn_usec,
                      const char *cmd, char **envp, const sigset_t *sigmask,
-                     char *result, size_t ressize)
-{
+                     char *result, size_t ressize) {
         struct udev *udev = event->udev;
         int outpipe[2] = {-1, -1};
         int errpipe[2] = {-1, -1};
@@ -728,11 +743,13 @@ int udev_event_spawn(struct udev_event *event,
                         errpipe[WRITE_END] = -1;
                 }
 
-                spawn_read(event, cmd,
-                         outpipe[READ_END], errpipe[READ_END],
-                         result, ressize);
+                spawn_read(event,
+                           timeout_usec,
+                           cmd,
+                           outpipe[READ_END], errpipe[READ_END],
+                           result, ressize);
 
-                err = spawn_wait(event, cmd, pid);
+                err = spawn_wait(event, timeout_usec, timeout_warn_usec, cmd, pid);
         }
 
 out:
@@ -747,37 +764,32 @@ out:
         return err;
 }
 
-static int rename_netif(struct udev_event *event)
-{
+static int rename_netif(struct udev_event *event) {
         struct udev_device *dev = event->dev;
-        _cleanup_rtnl_unref_ sd_rtnl *rtnl = NULL;
         char name[IFNAMSIZ];
         const char *oldname;
         int r;
 
         oldname = udev_device_get_sysname(dev);
 
-        log_debug("changing net interface name from '%s' to '%s'",
-                  oldname, event->name);
-
         strscpy(name, IFNAMSIZ, event->name);
 
-        r = sd_rtnl_open(&rtnl, 0);
-        if (r < 0)
-                return r;
-
-        r = rtnl_set_link_name(rtnl, udev_device_get_ifindex(dev), name);
-        if (r < 0)
-                log_error("error changing net interface name %s to %s: %s",
+        r = rtnl_set_link_name(&event->rtnl, udev_device_get_ifindex(dev), name);
+        if (r < 0) {
+                log_error("error changing net interface name '%s' to '%s': %s",
                           oldname, name, strerror(-r));
-        else
-                print_kmsg("renamed network interface %s to %s\n", oldname, name);
+                return r;
+        }
 
-        return r;
+        log_debug("renamed network interface '%s' to '%s'\n", oldname, name);
+
+        return 0;
 }
 
-void udev_event_execute_rules(struct udev_event *event, struct udev_rules *rules, const sigset_t *sigmask)
-{
+void udev_event_execute_rules(struct udev_event *event,
+                              usec_t timeout_usec,
+                              usec_t timeout_warn_usec,
+                              struct udev_rules *rules, const sigset_t *sigmask) {
         struct udev_device *dev = event->dev;
 
         if (udev_device_get_subsystem(dev) == NULL)
@@ -791,7 +803,7 @@ void udev_event_execute_rules(struct udev_event *event, struct udev_rules *rules
                 if (major(udev_device_get_devnum(dev)) != 0)
                         udev_watch_end(event->udev, dev);
 
-                udev_rules_apply_to_event(rules, event, sigmask);
+                udev_rules_apply_to_event(rules, event, timeout_usec, timeout_warn_usec, sigmask);
 
                 if (major(udev_device_get_devnum(dev)) != 0)
                         udev_node_remove(dev);
@@ -808,7 +820,23 @@ void udev_event_execute_rules(struct udev_event *event, struct udev_rules *rules
                                 udev_watch_end(event->udev, event->dev_db);
                 }
 
-                udev_rules_apply_to_event(rules, event, sigmask);
+                if (major(udev_device_get_devnum(dev)) == 0 &&
+                    streq(udev_device_get_action(dev), "move")) {
+                        struct udev_list_entry *entry;
+
+                        for ((entry = udev_device_get_properties_list_entry(event->dev_db)); entry; entry = udev_list_entry_get_next(entry)) {
+                                const char *key, *value;
+                                struct udev_list_entry *property;
+
+                                key = udev_list_entry_get_name(entry);
+                                value = udev_list_entry_get_value(entry);
+
+                                property = udev_device_add_property(event->dev, key, value);
+                                udev_list_entry_set_num(property, true);
+                        }
+                }
+
+                udev_rules_apply_to_event(rules, event, timeout_usec, timeout_warn_usec, sigmask);
 
                 /* rename a new network interface, if needed */
                 if (udev_device_get_ifindex(dev) > 0 && streq(udev_device_get_action(dev), "add") &&
@@ -819,8 +847,6 @@ void udev_event_execute_rules(struct udev_event *event, struct udev_rules *rules
 
                         r = rename_netif(event);
                         if (r >= 0) {
-                                log_debug("renamed netif to '%s'", event->name);
-
                                 /* remember old name */
                                 udev_device_add_property(dev, "INTERFACE_OLD", udev_device_get_sysname(dev));
 
@@ -883,8 +909,7 @@ void udev_event_execute_rules(struct udev_event *event, struct udev_rules *rules
         }
 }
 
-void udev_event_execute_run(struct udev_event *event, const sigset_t *sigmask)
-{
+void udev_event_execute_run(struct udev_event *event, usec_t timeout_usec, usec_t timeout_warn_usec, const sigset_t *sigmask) {
         struct udev_list_entry *list_entry;
 
         udev_list_entry_foreach(list_entry, udev_list_get_entry(&event->run_list)) {
@@ -907,7 +932,7 @@ void udev_event_execute_run(struct udev_event *event, const sigset_t *sigmask)
 
                         udev_event_apply_format(event, cmd, program, sizeof(program));
                         envp = udev_device_get_properties_envp(event->dev);
-                        udev_event_spawn(event, program, envp, sigmask, NULL, 0);
+                        udev_event_spawn(event, timeout_usec, timeout_warn_usec, program, envp, sigmask, NULL, 0);
                 }
         }
 }

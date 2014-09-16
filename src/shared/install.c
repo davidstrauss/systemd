@@ -45,8 +45,6 @@ typedef struct {
         Hashmap *have_installed;
 } InstallContext;
 
-#define _cleanup_install_context_done_ _cleanup_(install_context_done)
-
 static int in_search_path(const char *path, char **search) {
         _cleanup_free_ char *parent = NULL;
         int r;
@@ -88,15 +86,10 @@ static int get_config_path(UnitFileScope scope, bool runtime, const char *root_d
 
         case UNIT_FILE_SYSTEM:
 
-                if (root_dir && runtime)
-                        asprintf(&p, "%s/run/systemd/system", root_dir);
-                else if (runtime)
-                        p = strdup("/run/systemd/system");
-                else if (root_dir)
-                        asprintf(&p, "%s/%s", root_dir, SYSTEM_CONFIG_UNIT_PATH);
+                if (runtime)
+                        p = path_join(root_dir, "/run/systemd/system", NULL);
                 else
-                        p = strdup(SYSTEM_CONFIG_UNIT_PATH);
-
+                        p = path_join(root_dir, SYSTEM_CONFIG_UNIT_PATH, NULL);
                 break;
 
         case UNIT_FILE_GLOBAL:
@@ -1051,20 +1044,19 @@ static int config_parse_also(
                 void *data,
                 void *userdata) {
 
-        char *w;
         size_t l;
-        char *state;
+        const char *word, *state;
         InstallContext *c = data;
 
         assert(filename);
         assert(lvalue);
         assert(rvalue);
 
-        FOREACH_WORD_QUOTED(w, l, rvalue, state) {
+        FOREACH_WORD_QUOTED(word, l, rvalue, state) {
                 _cleanup_free_ char *n;
                 int r;
 
-                n = strndup(w, l);
+                n = strndup(word, l);
                 if (!n)
                         return -ENOMEM;
 
@@ -1072,6 +1064,9 @@ static int config_parse_also(
                 if (r < 0)
                         return r;
         }
+        if (!isempty(state))
+                log_syntax(unit, LOG_ERR, filename, line, EINVAL,
+                           "Trailing garbage, ignoring.");
 
         return 0;
 }
@@ -1164,7 +1159,7 @@ static int unit_file_load(
         assert(path);
 
         if (!isempty(root_dir))
-                path = strappenda3(root_dir, "/", path);
+                path = strappenda(root_dir, "/", path);
 
         fd = open(path, O_RDONLY|O_CLOEXEC|O_NOCTTY|(allow_symlink ? 0 : O_NOFOLLOW));
         if (fd < 0)
@@ -1176,7 +1171,10 @@ static int unit_file_load(
                 return -ENOMEM;
         }
 
-        r = config_parse(NULL, path, f, NULL, config_item_table_lookup, (void*) items, true, true, info);
+        r = config_parse(NULL, path, f,
+                         NULL,
+                         config_item_table_lookup, items,
+                         true, true, false, info);
         if (r < 0)
                 return r;
 
@@ -1261,7 +1259,7 @@ static int unit_file_can_install(
                 const char *name,
                 bool allow_symlink) {
 
-        _cleanup_install_context_done_ InstallContext c = {};
+        _cleanup_(install_context_done) InstallContext c = {};
         InstallInfo *i;
         int r;
 
@@ -1598,7 +1596,7 @@ int unit_file_enable(
                 unsigned *n_changes) {
 
         _cleanup_lookup_paths_free_ LookupPaths paths = {};
-        _cleanup_install_context_done_ InstallContext c = {};
+        _cleanup_(install_context_done) InstallContext c = {};
         char **i;
         _cleanup_free_ char *config_path = NULL;
         int r;
@@ -1637,7 +1635,7 @@ int unit_file_disable(
                 unsigned *n_changes) {
 
         _cleanup_lookup_paths_free_ LookupPaths paths = {};
-        _cleanup_install_context_done_ InstallContext c = {};
+        _cleanup_(install_context_done) InstallContext c = {};
         char **i;
         _cleanup_free_ char *config_path = NULL;
         _cleanup_set_free_free_ Set *remove_symlinks_to = NULL;
@@ -1697,7 +1695,7 @@ int unit_file_set_default(
                 unsigned *n_changes) {
 
         _cleanup_lookup_paths_free_ LookupPaths paths = {};
-        _cleanup_install_context_done_ InstallContext c = {};
+        _cleanup_(install_context_done) InstallContext c = {};
         _cleanup_free_ char *config_path = NULL;
         char *path;
         int r;
@@ -1758,11 +1756,7 @@ int unit_file_get_default(
                 _cleanup_free_ char *path = NULL, *tmp = NULL;
                 char *n;
 
-                if (isempty(root_dir))
-                        path = strappend(*p, "/" SPECIAL_DEFAULT_TARGET);
-                else
-                        path = strjoin(root_dir, "/", *p, "/" SPECIAL_DEFAULT_TARGET, NULL);
-
+                path = path_join(root_dir, *p, SPECIAL_DEFAULT_TARGET);
                 if (!path)
                         return -ENOMEM;
 
@@ -1820,15 +1814,12 @@ UnitFileState unit_file_get_state(
                 free(path);
                 path = NULL;
 
-                if (root_dir)
-                        asprintf(&path, "%s/%s/%s", root_dir, *i, name);
-                else
-                        asprintf(&path, "%s/%s", *i, name);
+                path = path_join(root_dir, *i, name);
                 if (!path)
                         return -ENOMEM;
 
                 if (root_dir)
-                        partial = path + strlen(root_dir) + 1;
+                        partial = path + strlen(root_dir);
                 else
                         partial = path;
 
@@ -1967,7 +1958,7 @@ int unit_file_preset(
                 UnitFileChange **changes,
                 unsigned *n_changes) {
 
-        _cleanup_install_context_done_ InstallContext plus = {}, minus = {};
+        _cleanup_(install_context_done) InstallContext plus = {}, minus = {};
         _cleanup_lookup_paths_free_ LookupPaths paths = {};
         _cleanup_free_ char *config_path = NULL;
         char **i;
@@ -1975,7 +1966,7 @@ int unit_file_preset(
 
         assert(scope >= 0);
         assert(scope < _UNIT_FILE_SCOPE_MAX);
-        assert(mode < _UNIT_FILE_PRESET_MODE_MAX);
+        assert(mode < _UNIT_FILE_PRESET_MAX);
 
         r = lookup_paths_init_from_scope(&paths, scope, root_dir);
         if (r < 0)
@@ -2035,7 +2026,7 @@ int unit_file_preset_all(
                 UnitFileChange **changes,
                 unsigned *n_changes) {
 
-        _cleanup_install_context_done_ InstallContext plus = {}, minus = {};
+        _cleanup_(install_context_done) InstallContext plus = {}, minus = {};
         _cleanup_lookup_paths_free_ LookupPaths paths = {};
         _cleanup_free_ char *config_path = NULL;
         char **i;
@@ -2043,7 +2034,7 @@ int unit_file_preset_all(
 
         assert(scope >= 0);
         assert(scope < _UNIT_FILE_SCOPE_MAX);
-        assert(mode < _UNIT_FILE_PRESET_MODE_MAX);
+        assert(mode < _UNIT_FILE_PRESET_MAX);
 
         r = lookup_paths_init_from_scope(&paths, scope, root_dir);
         if (r < 0)
@@ -2055,17 +2046,11 @@ int unit_file_preset_all(
 
         STRV_FOREACH(i, paths.unit_path) {
                 _cleanup_closedir_ DIR *d = NULL;
-                _cleanup_free_ char *buf = NULL;
-                const char *units_dir;
+                _cleanup_free_ char *units_dir;
 
-                if (!isempty(root_dir)) {
-                        buf = strjoin(root_dir, "/", *i, NULL);
-                        if (!buf)
-                                return -ENOMEM;
-
-                        units_dir = buf;
-                } else
-                        units_dir = *i;
+                units_dir = path_join(root_dir, *i, NULL);
+                if (!units_dir)
+                        return -ENOMEM;
 
                 d = opendir(units_dir);
                 if (!d) {
@@ -2133,14 +2118,15 @@ int unit_file_preset_all(
         return r;
 }
 
-static void unitfilelist_free(UnitFileList **f) {
-        if (!*f)
+static void unit_file_list_free_one(UnitFileList *f) {
+        if (!f)
                 return;
 
-        free((*f)->path);
-        free(*f);
+        free(f->path);
+        free(f);
 }
-#define _cleanup_unitfilelist_free_ _cleanup_(unitfilelist_free)
+
+DEFINE_TRIVIAL_CLEANUP_FUNC(UnitFileList*, unit_file_list_free_one);
 
 int unit_file_get_list(
                 UnitFileScope scope,
@@ -2159,23 +2145,23 @@ int unit_file_get_list(
         if (root_dir && scope != UNIT_FILE_SYSTEM)
                 return -EINVAL;
 
+        if (root_dir) {
+                r = access(root_dir, F_OK);
+                if (r < 0)
+                        return -errno;
+        }
+
         r = lookup_paths_init_from_scope(&paths, scope, root_dir);
         if (r < 0)
                 return r;
 
         STRV_FOREACH(i, paths.unit_path) {
                 _cleanup_closedir_ DIR *d = NULL;
-                _cleanup_free_ char *buf = NULL;
-                const char *units_dir;
+                _cleanup_free_ char *units_dir;
 
-                if (!isempty(root_dir)) {
-                        buf = strjoin(root_dir, "/", *i, NULL);
-                        if (!buf)
-                                return -ENOMEM;
-
-                        units_dir = buf;
-                } else
-                        units_dir = *i;
+                units_dir = path_join(root_dir, *i, NULL);
+                if (!units_dir)
+                        return -ENOMEM;
 
                 d = opendir(units_dir);
                 if (!d) {
@@ -2186,8 +2172,9 @@ int unit_file_get_list(
                 }
 
                 for (;;) {
-                        _cleanup_unitfilelist_free_ UnitFileList *f = NULL;
+                        _cleanup_(unit_file_list_free_onep) UnitFileList *f = NULL;
                         struct dirent *de;
+                        _cleanup_free_ char *path = NULL;
 
                         errno = 0;
                         de = readdir(d);
@@ -2237,7 +2224,11 @@ int unit_file_get_list(
                                 goto found;
                         }
 
-                        r = unit_file_can_install(&paths, root_dir, f->path, true);
+                        path = path_make_absolute(de->d_name, *i);
+                        if (!path)
+                                return -ENOMEM;
+
+                        r = unit_file_can_install(&paths, root_dir, path, true);
                         if (r == -EINVAL ||  /* Invalid setting? */
                             r == -EBADMSG || /* Invalid format? */
                             r == -ENOENT     /* Included file not found? */)
@@ -2281,7 +2272,7 @@ static const char* const unit_file_change_type_table[_UNIT_FILE_CHANGE_TYPE_MAX]
 
 DEFINE_STRING_TABLE_LOOKUP(unit_file_change_type, UnitFileChangeType);
 
-static const char* const unit_file_preset_mode_table[_UNIT_FILE_PRESET_MODE_MAX] = {
+static const char* const unit_file_preset_mode_table[_UNIT_FILE_PRESET_MAX] = {
         [UNIT_FILE_PRESET_FULL] = "full",
         [UNIT_FILE_PRESET_ENABLE_ONLY] = "enable-only",
         [UNIT_FILE_PRESET_DISABLE_ONLY] = "disable-only",

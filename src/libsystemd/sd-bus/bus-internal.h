@@ -298,6 +298,8 @@ struct sd_bus {
 
         sd_bus_message *current_message;
         sd_bus_slot *current_slot;
+        sd_bus_message_handler_t current_handler;
+        void *current_userdata;
 
         sd_bus **default_bus_ptr;
         pid_t tid;
@@ -381,3 +383,5 @@ int bus_set_address_system_remote(sd_bus *b, const char *host);
 int bus_set_address_system_container(sd_bus *b, const char *machine);
 
 int bus_remove_match_by_string(sd_bus *bus, const char *match, sd_bus_message_handler_t callback, void *userdata);
+
+int bus_get_root_path(sd_bus *bus);

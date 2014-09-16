@@ -26,7 +26,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include <systemd/sd-journal.h>
+#include "systemd/sd-journal.h"
 
 #include "build.h"
 #include "set.h"
@@ -81,29 +81,6 @@ static Set *new_matches(void) {
         return set;
 }
 
-static int help(void) {
-
-        printf("%s [OPTIONS...]\n\n"
-               "List or retrieve coredumps from the journal.\n\n"
-               "Flags:\n"
-               "  -h --help          Show this help\n"
-               "     --version       Print version string\n"
-               "     --no-pager      Do not pipe output into a pager\n"
-               "     --no-legend     Do not print the column headers.\n"
-               "  -1                 Show information about most recent entry only\n"
-               "  -F --field=FIELD   List all values a certain field takes\n"
-               "  -o --output=FILE   Write output to FILE\n\n"
-
-               "Commands:\n"
-               "  list [MATCHES...]  List available coredumps (default)\n"
-               "  info [MATCHES...]  Show detailed information about one or more coredumps\n"
-               "  dump [MATCHES...]  Print first matching coredump to stdout\n"
-               "  gdb [MATCHES...]   Start gdb for the first matching coredump\n"
-               , program_invocation_short_name);
-
-        return 0;
-}
-
 static int add_match(Set *set, const char *match) {
         int r = -ENOMEM;
         unsigned pid;
@@ -131,11 +108,9 @@ static int add_match(Set *set, const char *match) {
                 goto fail;
 
         log_debug("Adding pattern: %s", pattern);
-        r = set_put(set, pattern);
+        r = set_consume(set, pattern);
         if (r < 0) {
-                log_error("Failed to add pattern '%s': %s",
-                          pattern, strerror(-r));
-                free(pattern);
+                log_error("Failed to add pattern: %s", strerror(-r));
                 goto fail;
         }
 
@@ -143,6 +118,26 @@ static int add_match(Set *set, const char *match) {
 fail:
         log_error("Failed to add match: %s", strerror(-r));
         return r;
+}
+
+static void help(void) {
+        printf("%s [OPTIONS...]\n\n"
+               "List or retrieve coredumps from the journal.\n\n"
+               "Flags:\n"
+               "  -h --help          Show this help\n"
+               "     --version       Print version string\n"
+               "     --no-pager      Do not pipe output into a pager\n"
+               "     --no-legend     Do not print the column headers.\n"
+               "  -1                 Show information about most recent entry only\n"
+               "  -F --field=FIELD   List all values a certain field takes\n"
+               "  -o --output=FILE   Write output to FILE\n\n"
+
+               "Commands:\n"
+               "  list [MATCHES...]  List available coredumps (default)\n"
+               "  info [MATCHES...]  Show detailed information about one or more coredumps\n"
+               "  dump [MATCHES...]  Print first matching coredump to stdout\n"
+               "  gdb [MATCHES...]   Start gdb for the first matching coredump\n"
+               , program_invocation_short_name);
 }
 
 static int parse_argv(int argc, char *argv[], Set *matches) {
@@ -172,7 +167,8 @@ static int parse_argv(int argc, char *argv[], Set *matches) {
 
                 case 'h':
                         arg_action = ACTION_NONE;
-                        return help();
+                        help();
+                        return 0;
 
                 case ARG_VERSION:
                         arg_action = ACTION_NONE;

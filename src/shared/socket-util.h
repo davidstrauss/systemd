@@ -23,6 +23,7 @@
 
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/ether.h>
 #include <sys/un.h>
 #include <asm/types.h>
 #include <linux/netlink.h>
@@ -101,8 +102,17 @@ int sockaddr_pretty(const struct sockaddr *_sa, socklen_t salen, bool translate_
 int getpeername_pretty(int fd, char **ret);
 int getsockname_pretty(int fd, char **ret);
 
+int socknameinfo_pretty(union sockaddr_union *sa, socklen_t salen, char **_ret);
+int getnameinfo_pretty(int fd, char **ret);
+
 const char* socket_address_bind_ipv6_only_to_string(SocketAddressBindIPv6Only b) _const_;
 SocketAddressBindIPv6Only socket_address_bind_ipv6_only_from_string(const char *s) _pure_;
 
 int netlink_family_to_string_alloc(int b, char **s);
 int netlink_family_from_string(const char *s) _pure_;
+
+bool sockaddr_equal(const union sockaddr_union *a, const union sockaddr_union *b);
+
+#define ETHER_ADDR_TO_STRING_MAX (3*6)
+
+char* ether_addr_to_string(const struct ether_addr *addr, char buffer[ETHER_ADDR_TO_STRING_MAX]);

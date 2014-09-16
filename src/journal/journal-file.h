@@ -27,7 +27,7 @@
 #include <gcrypt.h>
 #endif
 
-#include <systemd/sd-id128.h>
+#include "systemd/sd-id128.h"
 
 #include "sparse-endian.h"
 #include "journal-def.h"
@@ -80,7 +80,7 @@ typedef struct JournalFile {
 
 #ifdef HAVE_XZ
         void *compress_buffer;
-        uint64_t compress_buffer_size;
+        size_t compress_buffer_size;
 #endif
 
 #ifdef HAVE_GCRYPT
@@ -214,14 +214,15 @@ static unsigned type_to_context(int type) {
 
 static inline int journal_file_object_keep(JournalFile *f, Object *o, uint64_t offset) {
         unsigned context = type_to_context(o->object.type);
+        uint64_t s = le64toh(o->object.size);
 
         return mmap_cache_get(f->mmap, f->fd, f->prot, context, true,
-                              offset, o->object.size, &f->last_stat, NULL);
+                              offset, s, &f->last_stat, NULL);
 }
 
 static inline int journal_file_object_release(JournalFile *f, Object *o, uint64_t offset) {
         unsigned context = type_to_context(o->object.type);
+        uint64_t s = le64toh(o->object.size);
 
-        return mmap_cache_release(f->mmap, f->fd, f->prot, context,
-                                  offset, o->object.size);
+        return mmap_cache_release(f->mmap, f->fd, f->prot, context, offset, s);
 }

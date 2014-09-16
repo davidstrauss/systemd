@@ -32,17 +32,17 @@
 
 NSS_GETHOSTBYNAME_PROTOTYPES(mymachines);
 
-static int count_addresses(sd_bus_message *m, unsigned af, unsigned *ret) {
+static int count_addresses(sd_bus_message *m, int af, unsigned *ret) {
         unsigned c = 0;
         int r;
 
         assert(m);
         assert(ret);
 
-        while ((r = sd_bus_message_enter_container(m, 'r', "yay")) > 0) {
-                unsigned char family;
+        while ((r = sd_bus_message_enter_container(m, 'r', "iay")) > 0) {
+                int family;
 
-                r = sd_bus_message_read(m, "y", &family);
+                r = sd_bus_message_read(m, "i", &family);
                 if (r < 0)
                         return r;
 
@@ -79,13 +79,13 @@ enum nss_status _nss_mymachines_gethostbyname4_r(
 
         struct gaih_addrtuple *r_tuple, *r_tuple_first = NULL;
         _cleanup_bus_message_unref_ sd_bus_message* reply = NULL;
-        _cleanup_bus_unref_ sd_bus *bus = NULL;
-        _cleanup_free_ int *ifindexes = NULL;
+        _cleanup_bus_close_unref_ sd_bus *bus = NULL;
+        _cleanup_free_ int *ifindices = NULL;
         _cleanup_free_ char *class = NULL;
         size_t l, ms, idx;
         unsigned i = 0, c = 0;
         char *r_name;
-        int n_ifindexes, r;
+        int n_ifindices, r;
 
         assert(name);
         assert(pat);
@@ -101,9 +101,9 @@ enum nss_status _nss_mymachines_gethostbyname4_r(
                 goto fail;
         }
 
-        n_ifindexes = sd_machine_get_ifindexes(name, &ifindexes);
-        if (n_ifindexes < 0) {
-                r = n_ifindexes;
+        n_ifindices = sd_machine_get_ifindices(name, &ifindices);
+        if (n_ifindices < 0) {
+                r = n_ifindices;
                 goto fail;
         }
 
@@ -122,7 +122,7 @@ enum nss_status _nss_mymachines_gethostbyname4_r(
         if (r < 0)
                 goto fail;
 
-        r = sd_bus_message_enter_container(reply, 'a', "(yay)");
+        r = sd_bus_message_enter_container(reply, 'a', "(iay)");
         if (r < 0)
                 goto fail;
 
@@ -131,7 +131,7 @@ enum nss_status _nss_mymachines_gethostbyname4_r(
                 goto fail;
 
         if (c <= 0) {
-                *errnop = ENOENT;
+                *errnop = ESRCH;
                 *h_errnop = HOST_NOT_FOUND;
                 return NSS_STATUS_NOTFOUND;
         }
@@ -140,7 +140,7 @@ enum nss_status _nss_mymachines_gethostbyname4_r(
         ms = ALIGN(l+1) + ALIGN(sizeof(struct gaih_addrtuple)) * c;
         if (buflen < ms) {
                 *errnop = ENOMEM;
-                *h_errnop = NO_RECOVERY;
+                *h_errnop = TRY_AGAIN;
                 return NSS_STATUS_TRYAGAIN;
         }
 
@@ -151,12 +151,12 @@ enum nss_status _nss_mymachines_gethostbyname4_r(
 
         /* Second, append addresses */
         r_tuple_first = (struct gaih_addrtuple*) (buffer + idx);
-        while ((r = sd_bus_message_enter_container(reply, 'r', "yay")) > 0) {
-                unsigned char family;
+        while ((r = sd_bus_message_enter_container(reply, 'r', "iay")) > 0) {
+                int family;
                 const void *a;
                 size_t sz;
 
-                r = sd_bus_message_read(reply, "y", &family);
+                r = sd_bus_message_read(reply, "i", &family);
                 if (r < 0)
                         goto fail;
 
@@ -168,7 +168,12 @@ enum nss_status _nss_mymachines_gethostbyname4_r(
                 if (r < 0)
                         goto fail;
 
-                if (sz != PROTO_ADDRESS_SIZE(family)) {
+                if (!IN_SET(family, AF_INET, AF_INET6)) {
+                        r = -EAFNOSUPPORT;
+                        goto fail;
+                }
+
+                if (sz != FAMILY_ADDRESS_SIZE(family)) {
                         r = -EINVAL;
                         goto fail;
                 }
@@ -177,7 +182,7 @@ enum nss_status _nss_mymachines_gethostbyname4_r(
                 r_tuple->next = i == c-1 ? NULL : (struct gaih_addrtuple*) ((char*) r_tuple + ALIGN(sizeof(struct gaih_addrtuple)));
                 r_tuple->name = r_name;
                 r_tuple->family = family;
-                r_tuple->scopeid = n_ifindexes == 1 ? ifindexes[0] : 0;
+                r_tuple->scopeid = n_ifindices == 1 ? ifindices[0] : 0;
                 memcpy(r_tuple->addr, a, sz);
 
                 idx += ALIGN(sizeof(struct gaih_addrtuple));
@@ -200,6 +205,11 @@ enum nss_status _nss_mymachines_gethostbyname4_r(
         if (ttlp)
                 *ttlp = 0;
 
+        /* Explicitly reset all error variables */
+        *errnop = 0;
+        *h_errnop = NETDB_SUCCESS;
+        h_errno = 0;
+
         return NSS_STATUS_SUCCESS;
 
 fail:
@@ -218,7 +228,7 @@ enum nss_status _nss_mymachines_gethostbyname3_r(
                 char **canonp) {
 
         _cleanup_bus_message_unref_ sd_bus_message* reply = NULL;
-        _cleanup_bus_unref_ sd_bus *bus = NULL;
+        _cleanup_bus_close_unref_ sd_bus *bus = NULL;
         _cleanup_free_ char *class = NULL;
         unsigned c = 0, i = 0;
         char *r_name, *r_aliases, *r_addr, *r_addr_list;
@@ -262,7 +272,7 @@ enum nss_status _nss_mymachines_gethostbyname3_r(
         if (r < 0)
                 goto fail;
 
-        r = sd_bus_message_enter_container(reply, 'a', "(yay)");
+        r = sd_bus_message_enter_container(reply, 'a', "(iay)");
         if (r < 0)
                 goto fail;
 
@@ -276,7 +286,7 @@ enum nss_status _nss_mymachines_gethostbyname3_r(
                 return NSS_STATUS_NOTFOUND;
         }
 
-        alen = PROTO_ADDRESS_SIZE(af);
+        alen = FAMILY_ADDRESS_SIZE(af);
         l = strlen(name);
 
         ms = ALIGN(l+1) +
@@ -302,12 +312,12 @@ enum nss_status _nss_mymachines_gethostbyname3_r(
 
         /* Third, append addresses */
         r_addr = buffer + idx;
-        while ((r = sd_bus_message_enter_container(reply, 'r', "yay")) > 0) {
-                unsigned char family;
+        while ((r = sd_bus_message_enter_container(reply, 'r', "iay")) > 0) {
+                int family;
                 const void *a;
                 size_t sz;
 
-                r = sd_bus_message_read(reply, "y", &family);
+                r = sd_bus_message_read(reply, "i", &family);
                 if (r < 0)
                         goto fail;
 
@@ -359,6 +369,11 @@ enum nss_status _nss_mymachines_gethostbyname3_r(
 
         if (canonp)
                 *canonp = r_name;
+
+        /* Explicitly reset all error variables */
+        *errnop = 0;
+        *h_errnop = NETDB_SUCCESS;
+        h_errno = 0;
 
         return NSS_STATUS_SUCCESS;
 

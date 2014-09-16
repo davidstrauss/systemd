@@ -21,9 +21,9 @@
 #include "util.h"
 #include "macro.h"
 
-typedef int (compress_t)(const void *src, uint64_t src_size, void *dst, uint64_t *dst_size);
+typedef int (compress_t)(const void *src, uint64_t src_size, void *dst, size_t *dst_size);
 typedef int (decompress_t)(const void *src, uint64_t src_size,
-                           void **dst, uint64_t *dst_alloc_size, uint64_t* dst_size, uint64_t dst_max);
+                           void **dst, size_t *dst_alloc_size, size_t* dst_size, size_t dst_max);
 
 #define MAX_SIZE (1024*1024LU)
 
@@ -42,7 +42,7 @@ static char* make_buf(size_t count) {
 
 static void test_compress_decompress(const char* label,
                                      compress_t compress, decompress_t decompress) {
-        usec_t n, n2;
+        usec_t n, n2 = 0;
         float dt;
 
         _cleanup_free_ char *text, *buf;
@@ -61,7 +61,7 @@ static void test_compress_decompress(const char* label,
                 int r;
 
                 r = compress(text, i, buf, &j);
-                /* assume compresion must be succesful except for small inputs */
+                /* assume compression must be successful except for small inputs */
                 assert(r == 0 || (i < 2048 && r == -ENOBUFS));
                 /* check for overwrites */
                 assert(buf[i] == 0);

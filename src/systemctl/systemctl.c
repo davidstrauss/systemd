@@ -617,7 +617,7 @@ static int get_unit_list_recursive(
                         return r;
 
                 STRV_FOREACH(i, machines) {
-                        _cleanup_bus_unref_ sd_bus *container = NULL;
+                        _cleanup_bus_close_unref_ sd_bus *container = NULL;
                         int k;
 
                         r = sd_bus_open_system_container(&container, *i);
@@ -1142,7 +1142,7 @@ static usec_t calc_next_elapse(dual_timestamp *nw, dual_timestamp *next) {
         assert(nw);
         assert(next);
 
-        if (next->monotonic != (usec_t) -1 && next->monotonic > 0) {
+        if (next->monotonic != USEC_INFINITY && next->monotonic > 0) {
                 usec_t converted;
 
                 if (next->monotonic > nw->monotonic)
@@ -1150,7 +1150,7 @@ static usec_t calc_next_elapse(dual_timestamp *nw, dual_timestamp *next) {
                 else
                         converted = nw->realtime - (nw->monotonic - next->monotonic);
 
-                if (next->realtime != (usec_t) -1 && next->realtime > 0)
+                if (next->realtime != USEC_INFINITY && next->realtime > 0)
                         next_elapse = MIN(converted, next->realtime);
                 else
                         next_elapse = converted;
@@ -1350,8 +1350,9 @@ static int list_unit_files(sd_bus *bus, char **args) {
                 }
 
                 n_units = hashmap_size(h);
+
                 units = new(UnitFileList, n_units);
-                if (!units) {
+                if (!units && n_units > 0) {
                         unit_file_list_free(h);
                         return log_oom();
                 }
@@ -1407,14 +1408,13 @@ static int list_unit_files(sd_bus *bus, char **args) {
                         return bus_log_parse_error(r);
         }
 
-        if (c > 0) {
-                qsort(units, c, sizeof(UnitFileList), compare_unit_file_list);
-                output_unit_file_list(units, c);
-        }
+        qsort_safe(units, c, sizeof(UnitFileList), compare_unit_file_list);
+        output_unit_file_list(units, c);
 
-        if (avoid_bus())
+        if (avoid_bus()) {
                 for (unit = units; unit < units + c; unit++)
                         free(unit->path);
+        }
 
         return 0;
 }
@@ -1688,7 +1688,7 @@ static int compare_machine_info(const void *a, const void *b) {
 }
 
 static int get_machine_properties(sd_bus *bus, struct machine_info *mi) {
-        _cleanup_bus_unref_ sd_bus *container = NULL;
+        _cleanup_bus_close_unref_ sd_bus *container = NULL;
         int r;
 
         assert(mi);
@@ -2351,8 +2351,18 @@ static int check_wait_response(WaitData *d) {
                         log_error("Job for %s canceled.", strna(d->name));
                 else if (streq(d->result, "dependency"))
                         log_error("A dependency job for %s failed. See 'journalctl -xn' for details.", strna(d->name));
-                else if (!streq(d->result, "done") && !streq(d->result, "skipped"))
-                        log_error("Job for %s failed. See 'systemctl status %s' and 'journalctl -xn' for details.", strna(d->name), strna(d->name));
+                else if (!streq(d->result, "done") && !streq(d->result, "skipped")) {
+                        if (d->name) {
+                                bool quotes;
+
+                                quotes = chars_intersect(d->name, SHELL_NEED_QUOTES);
+
+                                log_error("Job for %s failed. See \"systemctl status %s%s%s\" and \"journalctl -xn\" for details.",
+                                          d->name,
+                                          quotes ? "'" : "", d->name, quotes ? "'" : "");
+                        } else
+                                log_error("Job failed. See \"journalctl -xn\" for details.");
+                }
         }
 
         if (streq(d->result, "timeout"))
@@ -2382,7 +2392,7 @@ static int wait_for_jobs(sd_bus *bus, Set *s) {
         while (!set_isempty(s)) {
                 q = bus_process_wait(bus);
                 if (q < 0) {
-                        log_error("Failed to wait for response: %s", strerror(-r));
+                        log_error("Failed to wait for response: %s", strerror(-q));
                         return q;
                 }
 
@@ -3503,50 +3513,11 @@ static void show_unit_help(UnitStatusInfo *i) {
                 return;
         }
 
-        STRV_FOREACH(p, i->documentation) {
-
-                if (startswith(*p, "man:")) {
-                        const char *args[4] = { "man", NULL, NULL, NULL };
-                        _cleanup_free_ char *page = NULL, *section = NULL;
-                        char *e = NULL;
-                        pid_t pid;
-                        size_t k;
-
-                        k = strlen(*p);
-
-                        if ((*p)[k-1] == ')')
-                                e = strrchr(*p, '(');
-
-                        if (e) {
-                                page = strndup((*p) + 4, e - *p - 4);
-                                section = strndup(e + 1, *p + k - e - 2);
-                                if (!page || !section) {
-                                        log_oom();
-                                        return;
-                                }
-
-                                args[1] = section;
-                                args[2] = page;
-                        } else
-                                args[1] = *p + 4;
-
-                        pid = fork();
-                        if (pid < 0) {
-                                log_error("Failed to fork: %m");
-                                continue;
-                        }
-
-                        if (pid == 0) {
-                                /* Child */
-                                execvp(args[0], (char**) args);
-                                log_error("Failed to execute man: %m");
-                                _exit(EXIT_FAILURE);
-                        }
-
-                        wait_for_terminate(pid, NULL);
-                } else
+        STRV_FOREACH(p, i->documentation)
+                if (startswith(*p, "man:"))
+                        show_man_page(*p + 4, false);
+                else
                         log_info("Can't show: %s", *p);
-        }
 }
 
 static int status_property(const char *name, sd_bus_message *m, UnitStatusInfo *i, const char *contents) {
@@ -4866,7 +4837,7 @@ static int switch_root(sd_bus *bus, char **args) {
                 const char *root_systemd_path = NULL, *root_init_path = NULL;
 
                 root_systemd_path = strappenda(root, "/" SYSTEMD_BINARY_PATH);
-                root_init_path = strappenda3(root, "/", init);
+                root_init_path = strappenda(root, "/", init);
 
                 /* If the passed init is actually the same as the
                  * systemd binary, then let's suppress it. */
@@ -5037,15 +5008,9 @@ static int enable_sysv_units(const char *verb, char **args) {
                 STRV_FOREACH(k, paths.unit_path) {
                         _cleanup_free_ char *path = NULL;
 
-                        if (!isempty(arg_root))
-                                asprintf(&path, "%s/%s/%s", arg_root, *k, name);
-                        else
-                                asprintf(&path, "%s/%s", *k, name);
-
-                        if (!path) {
-                                r = log_oom();
-                                goto finish;
-                        }
+                        path = path_join(arg_root, *k, name);
+                        if (!path)
+                                return log_oom();
 
                         found_native = access(path, F_OK) >= 0;
                         if (found_native)
@@ -5055,14 +5020,9 @@ static int enable_sysv_units(const char *verb, char **args) {
                 if (found_native)
                         continue;
 
-                if (!isempty(arg_root))
-                        asprintf(&p, "%s/" SYSTEM_SYSVINIT_PATH "/%s", arg_root, name);
-                else
-                        asprintf(&p, SYSTEM_SYSVINIT_PATH "/%s", name);
-                if (!p) {
-                        r = log_oom();
-                        goto finish;
-                }
+                p = path_join(arg_root, SYSTEM_SYSVINIT_PATH, name);
+                if (!p)
+                        return log_oom();
 
                 p[strlen(p) - strlen(".service")] = 0;
                 found_sysv = access(p, F_OK) >= 0;
@@ -5084,18 +5044,15 @@ static int enable_sysv_units(const char *verb, char **args) {
                 argv[c] = NULL;
 
                 l = strv_join((char**)argv, " ");
-                if (!l) {
-                        r = log_oom();
-                        goto finish;
-                }
+                if (!l)
+                        return log_oom();
 
                 log_info("Executing %s", l);
 
                 pid = fork();
                 if (pid < 0) {
                         log_error("Failed to fork: %m");
-                        r = -errno;
-                        goto finish;
+                        return -errno;
                 } else if (pid == 0) {
                         /* Child */
 
@@ -5106,8 +5063,7 @@ static int enable_sysv_units(const char *verb, char **args) {
                 j = wait_for_terminate(pid, &status);
                 if (j < 0) {
                         log_error("Failed to wait for child: %s", strerror(-r));
-                        r = j;
-                        goto finish;
+                        return j;
                 }
 
                 if (status.si_code == CLD_EXITED) {
@@ -5121,17 +5077,12 @@ static int enable_sysv_units(const char *verb, char **args) {
                                                 puts("disabled");
                                 }
 
-                        } else if (status.si_status != 0) {
-                                r = -EINVAL;
-                                goto finish;
-                        }
-                } else {
-                        r = -EPROTO;
-                        goto finish;
-                }
+                        } else if (status.si_status != 0)
+                                return -EINVAL;
+                } else
+                        return -EPROTO;
         }
 
-finish:
         /* Drop all SysV units */
         for (f = 0, t = 0; args[f]; f++) {
 
@@ -5491,7 +5442,7 @@ static int is_system_running(sd_bus *bus, char **args) {
         return streq(state, "running") ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
-static int systemctl_help(void) {
+static void systemctl_help(void) {
 
         pager_open_if_enabled();
 
@@ -5616,12 +5567,9 @@ static int systemctl_help(void) {
                "  hibernate                       Hibernate the system\n"
                "  hybrid-sleep                    Hibernate and suspend the system\n",
                program_invocation_short_name);
-
-        return 0;
 }
 
-static int halt_help(void) {
-
+static void halt_help(void) {
         printf("%s [OPTIONS...]%s\n\n"
                "%s the system.\n\n"
                "     --help      Show this help\n"
@@ -5637,12 +5585,9 @@ static int halt_help(void) {
                arg_action == ACTION_REBOOT   ? "Reboot" :
                arg_action == ACTION_POWEROFF ? "Power off" :
                                                "Halt");
-
-        return 0;
 }
 
-static int shutdown_help(void) {
-
+static void shutdown_help(void) {
         printf("%s [OPTIONS...] [TIME] [WALL...]\n\n"
                "Shut down the system.\n\n"
                "     --help      Show this help\n"
@@ -5654,12 +5599,9 @@ static int shutdown_help(void) {
                "     --no-wall   Don't send wall message before halt/power-off/reboot\n"
                "  -c             Cancel a pending shutdown\n",
                program_invocation_short_name);
-
-        return 0;
 }
 
-static int telinit_help(void) {
-
+static void telinit_help(void) {
         printf("%s [OPTIONS...] {COMMAND}\n\n"
                "Send control commands to the init daemon.\n\n"
                "     --help      Show this help\n"
@@ -5672,32 +5614,26 @@ static int telinit_help(void) {
                "  q, Q           Reload init daemon configuration\n"
                "  u, U           Reexecute init daemon\n",
                program_invocation_short_name);
-
-        return 0;
 }
 
-static int runlevel_help(void) {
-
+static void runlevel_help(void) {
         printf("%s [OPTIONS...]\n\n"
                "Prints the previous and current runlevel of the init system.\n\n"
                "     --help      Show this help\n",
                program_invocation_short_name);
-
-        return 0;
 }
 
-static int help_types(void) {
+static void help_types(void) {
         int i;
         const char *t;
 
-        puts("Available unit types:");
+        if (!arg_no_legend)
+                puts("Available unit types:");
         for (i = 0; i < _UNIT_TYPE_MAX; i++) {
                 t = unit_type_to_string(i);
                 if (t)
                         puts(t);
         }
-
-        return 0;
 }
 
 static int systemctl_parse_argv(int argc, char *argv[]) {
@@ -5779,12 +5715,13 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "ht:p:alqfs:H:M:n:o:ir", options, NULL)) >= 0) {
+        while ((c = getopt_long(argc, argv, "ht:p:alqfs:H:M:n:o:ir", options, NULL)) >= 0)
 
                 switch (c) {
 
                 case 'h':
-                        return systemctl_help();
+                        systemctl_help();
+                        return 0;
 
                 case ARG_VERSION:
                         puts(PACKAGE_STRING);
@@ -5792,7 +5729,7 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
                         return 0;
 
                 case 't': {
-                        char *word, *state;
+                        const char *word, *state;
                         size_t size;
 
                         FOREACH_WORD_SEPARATOR(word, size, optarg, ",", state) {
@@ -5841,7 +5778,7 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
                                 if (!arg_properties)
                                         return log_oom();
                         } else {
-                                char *word, *state;
+                                const char *word, *state;
                                 size_t size;
 
                                 FOREACH_WORD_SEPARATOR(word, size, optarg, ",", state) {
@@ -6011,7 +5948,7 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
                         break;
 
                 case ARG_STATE: {
-                        char *word, *state;
+                        const char *word, *state;
                         size_t size;
 
                         FOREACH_WORD_SEPARATOR(word, size, optarg, ",", state) {
@@ -6052,7 +5989,6 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
                 default:
                         assert_not_reached("Unhandled option");
                 }
-        }
 
         if (arg_transport != BUS_TRANSPORT_LOCAL && arg_scope != UNIT_FILE_SYSTEM) {
                 log_error("Cannot access user instance remotely.");
@@ -6092,11 +6028,12 @@ static int halt_parse_argv(int argc, char *argv[]) {
                 if (runlevel == '0' || runlevel == '6')
                         arg_force = 2;
 
-        while ((c = getopt_long(argc, argv, "pfwdnih", options, NULL)) >= 0) {
+        while ((c = getopt_long(argc, argv, "pfwdnih", options, NULL)) >= 0)
                 switch (c) {
 
                 case ARG_HELP:
-                        return halt_help();
+                        halt_help();
+                        return 0;
 
                 case ARG_HALT:
                         arg_action = ACTION_HALT;
@@ -6139,7 +6076,6 @@ static int halt_parse_argv(int argc, char *argv[]) {
                 default:
                         assert_not_reached("Unhandled option");
                 }
-        }
 
         if (arg_action == ACTION_REBOOT && (argc == optind || argc == optind + 1)) {
                 r = update_reboot_param_file(argc == optind + 1 ? argv[optind] : NULL);
@@ -6224,11 +6160,12 @@ static int shutdown_parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "HPrhkt:afFc", options, NULL)) >= 0) {
+        while ((c = getopt_long(argc, argv, "HPrhkt:afFc", options, NULL)) >= 0)
                 switch (c) {
 
                 case ARG_HELP:
-                        return shutdown_help();
+                        shutdown_help();
+                        return 0;
 
                 case 'H':
                         arg_action = ACTION_HALT;
@@ -6277,7 +6214,6 @@ static int shutdown_parse_argv(int argc, char *argv[]) {
                 default:
                         assert_not_reached("Unhandled option");
                 }
-        }
 
         if (argc > optind && arg_action != ACTION_CANCEL_SHUTDOWN) {
                 r = parse_time_spec(argv[optind], &arg_when);
@@ -6338,11 +6274,12 @@ static int telinit_parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "", options, NULL)) >= 0) {
+        while ((c = getopt_long(argc, argv, "", options, NULL)) >= 0)
                 switch (c) {
 
                 case ARG_HELP:
-                        return telinit_help();
+                        telinit_help();
+                        return 0;
 
                 case ARG_NO_WALL:
                         arg_no_wall = true;
@@ -6354,10 +6291,10 @@ static int telinit_parse_argv(int argc, char *argv[]) {
                 default:
                         assert_not_reached("Unhandled option");
                 }
-        }
 
         if (optind >= argc) {
-                telinit_help();
+                log_error("%s: required argument missing.",
+                          program_invocation_short_name);
                 return -EINVAL;
         }
 
@@ -6403,11 +6340,12 @@ static int runlevel_parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "", options, NULL)) >= 0) {
+        while ((c = getopt_long(argc, argv, "", options, NULL)) >= 0)
                 switch (c) {
 
                 case ARG_HELP:
-                        return runlevel_help();
+                        runlevel_help();
+                        return 0;
 
                 case '?':
                         return -EINVAL;
@@ -6415,7 +6353,6 @@ static int runlevel_parse_argv(int argc, char *argv[]) {
                 default:
                         assert_not_reached("Unhandled option");
                 }
-        }
 
         if (optind < argc) {
                 log_error("Too many arguments.");
@@ -6901,7 +6838,7 @@ static int runlevel_main(void) {
 }
 
 int main(int argc, char*argv[]) {
-        _cleanup_bus_unref_ sd_bus *bus = NULL;
+        _cleanup_bus_close_unref_ sd_bus *bus = NULL;
         int r;
 
         setlocale(LC_ALL, "");

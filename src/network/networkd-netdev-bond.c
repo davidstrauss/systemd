@@ -42,6 +42,29 @@ static const char* const bond_mode_table[_NETDEV_BOND_MODE_MAX] = {
 DEFINE_STRING_TABLE_LOOKUP(bond_mode, BondMode);
 DEFINE_CONFIG_PARSE_ENUM(config_parse_bond_mode, bond_mode, BondMode, "Failed to parse bond mode");
 
+
+static const char* const bond_xmit_hash_policy_table[_NETDEV_BOND_XMIT_HASH_POLICY_MAX] = {
+        [NETDEV_BOND_XMIT_HASH_POLICY_LAYER2] = "layer2",
+        [NETDEV_BOND_XMIT_HASH_POLICY_LAYER34] = "layer3+4",
+        [NETDEV_BOND_XMIT_HASH_POLICY_LAYER23] = "layer2+3",
+        [NETDEV_BOND_XMIT_HASH_POLICY_ENCAP23] = "encap2+3",
+        [NETDEV_BOND_XMIT_HASH_POLICY_ENCAP34] = "encap3+4",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(bond_xmit_hash_policy, BondXmitHashPolicy);
+DEFINE_CONFIG_PARSE_ENUM(config_parse_bond_xmit_hash_policy,
+                         bond_xmit_hash_policy,
+                         BondXmitHashPolicy,
+                         "Failed to parse bond transmit hash policy")
+
+static const char* const bond_lacp_rate_table[_NETDEV_BOND_LACP_RATE_MAX] = {
+        [NETDEV_BOND_LACP_RATE_SLOW] = "slow",
+        [NETDEV_BOND_LACP_RATE_FAST] = "fast",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(bond_lacp_rate, BondLacpRate);
+DEFINE_CONFIG_PARSE_ENUM(config_parse_bond_lacp_rate, bond_lacp_rate, BondLacpRate, "Failed to parse bond lacp rate")
+
 static uint8_t bond_mode_to_kernel(BondMode mode) {
         switch (mode) {
         case NETDEV_BOND_MODE_BALANCE_RR:
@@ -63,39 +86,35 @@ static uint8_t bond_mode_to_kernel(BondMode mode) {
         }
 }
 
-static int netdev_bond_fill_message_create(NetDev *netdev, sd_rtnl_message *m) {
+static uint8_t bond_xmit_hash_policy_to_kernel(BondXmitHashPolicy policy) {
+        switch (policy) {
+        case NETDEV_BOND_XMIT_HASH_POLICY_LAYER2:
+                return BOND_XMIT_POLICY_LAYER2;
+        case NETDEV_BOND_XMIT_HASH_POLICY_LAYER34:
+                return BOND_XMIT_POLICY_LAYER34;
+        case NETDEV_BOND_XMIT_HASH_POLICY_LAYER23:
+                return BOND_XMIT_POLICY_LAYER23;
+        case NETDEV_BOND_XMIT_HASH_POLICY_ENCAP23:
+                return BOND_XMIT_POLICY_ENCAP23;
+        case NETDEV_BOND_XMIT_HASH_POLICY_ENCAP34:
+                return BOND_XMIT_POLICY_ENCAP34;
+        default:
+                return (uint8_t) -1;
+        }
+}
+
+static int netdev_bond_fill_message_create(NetDev *netdev, Link *link, sd_rtnl_message *m) {
+        Bond *b = BOND(netdev);
         int r;
 
+        assert(netdev);
+        assert(!link);
+        assert(b);
         assert(m);
 
-        r = sd_rtnl_message_append_string(m, IFLA_IFNAME, netdev->ifname);
-        if (r < 0) {
-                log_error_netdev(netdev,
-                                 "Could not append IFLA_IFNAME, attribute: %s",
-                                 strerror(-r));
-                return r;
-        }
-
-        r = sd_rtnl_message_open_container(m, IFLA_LINKINFO);
-        if (r < 0) {
-                log_error_netdev(netdev,
-                                 "Could not append IFLA_LINKINFO attribute: %s",
-                                 strerror(-r));
-                return r;
-        }
-
-        r = sd_rtnl_message_open_container_union(m, IFLA_INFO_DATA,
-                                                 netdev_kind_to_string(netdev->kind));
-        if (r < 0) {
-                log_error_netdev(netdev,
-                                 "Could not append IFLA_INFO_DATA attribute: %s",
-                                 strerror(-r));
-                return r;
-        }
-
-        if (netdev->bond_mode != _NETDEV_BOND_MODE_INVALID) {
+        if (b->mode != _NETDEV_BOND_MODE_INVALID) {
                 r = sd_rtnl_message_append_u8(m, IFLA_BOND_MODE,
-                                              bond_mode_to_kernel(netdev->bond_mode));
+                                              bond_mode_to_kernel(b->mode));
                 if (r < 0) {
                         log_error_netdev(netdev,
                                          "Could not append IFLA_BOND_MODE attribute: %s",
@@ -104,26 +123,76 @@ static int netdev_bond_fill_message_create(NetDev *netdev, sd_rtnl_message *m) {
                 }
         }
 
-        r = sd_rtnl_message_close_container(m);
-        if (r < 0) {
-                log_error_netdev(netdev,
-                                 "Could not append IFLA_LINKINFO attribute: %s",
-                                 strerror(-r));
-                return r;
+        if (b->xmit_hash_policy != _NETDEV_BOND_XMIT_HASH_POLICY_INVALID) {
+                r = sd_rtnl_message_append_u8(m, IFLA_BOND_XMIT_HASH_POLICY,
+                                              bond_xmit_hash_policy_to_kernel(b->xmit_hash_policy));
+                if (r < 0) {
+                        log_error_netdev(netdev,
+                                         "Could not append IFLA_BOND_XMIT_HASH_POLICY attribute: %s",
+                                         strerror(-r));
+                        return r;
+                }
         }
 
-        r = sd_rtnl_message_close_container(m);
-        if (r < 0) {
-                log_error_netdev(netdev,
-                                 "Could not append IFLA_LINKINFO attribute: %s",
-                                 strerror(-r));
-                return r;
+        if (b->lacp_rate != _NETDEV_BOND_LACP_RATE_INVALID &&
+            b->mode == NETDEV_BOND_MODE_802_3AD) {
+                r = sd_rtnl_message_append_u8(m, IFLA_BOND_AD_LACP_RATE, b->lacp_rate );
+                if (r < 0) {
+                        log_error_netdev(netdev,
+                                         "Could not append IFLA_BOND_AD_LACP_RATE attribute: %s",
+                                         strerror(-r));
+                        return r;
+                }
         }
 
-        return r;
+        if (b->miimon != 0) {
+                r = sd_rtnl_message_append_u32(m, IFLA_BOND_MIIMON, b->miimon / USEC_PER_MSEC);
+                if (r < 0) {
+                        log_error_netdev(netdev,
+                                         "Could not append IFLA_BOND_BOND_MIIMON attribute: %s",
+                                         strerror(-r));
+                        return r;
+                }
+        }
+
+        if (b->downdelay != 0) {
+                r = sd_rtnl_message_append_u32(m, IFLA_BOND_DOWNDELAY, b->downdelay / USEC_PER_MSEC);
+                if (r < 0) {
+                        log_error_netdev(netdev,
+                                         "Could not append IFLA_BOND_DOWNDELAY attribute: %s",
+                                         strerror(-r));
+                        return r;
+                }
+        }
+
+        if (b->updelay != 0) {
+                r = sd_rtnl_message_append_u32(m, IFLA_BOND_UPDELAY, b->updelay / USEC_PER_MSEC);
+                if (r < 0) {
+                        log_error_netdev(netdev,
+                                         "Could not append IFLA_BOND_UPDELAY attribute: %s",
+                                         strerror(-r));
+                        return r;
+                }
+        }
+
+        return 0;
+}
+
+static void bond_init(NetDev *netdev) {
+        Bond *b = BOND(netdev);
+
+        assert(netdev);
+        assert(b);
+
+        b->mode = _NETDEV_BOND_MODE_INVALID;
+        b->xmit_hash_policy = _NETDEV_BOND_XMIT_HASH_POLICY_INVALID;
+        b->lacp_rate = _NETDEV_BOND_LACP_RATE_INVALID;
 }
 
 const NetDevVTable bond_vtable = {
+        .object_size = sizeof(Bond),
+        .init = bond_init,
+        .sections = "Match\0NetDev\0Bond\0",
         .fill_message_create = netdev_bond_fill_message_create,
-        .enslave = netdev_enslave,
+        .create_type = NETDEV_CREATE_MASTER,
 };

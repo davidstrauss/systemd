@@ -188,17 +188,17 @@ static int print_addresses(sd_bus *bus, const char *name, int ifi, const char *p
         if (r < 0)
                 return r;
 
-        r = sd_bus_message_enter_container(reply, 'a', "(yay)");
+        r = sd_bus_message_enter_container(reply, 'a', "(iay)");
         if (r < 0)
                 return bus_log_parse_error(r);
 
-        while ((r = sd_bus_message_enter_container(reply, 'r', "yay")) > 0) {
-                unsigned char family;
+        while ((r = sd_bus_message_enter_container(reply, 'r', "iay")) > 0) {
+                int family;
                 const void *a;
                 size_t sz;
                 char buffer[MAX(INET6_ADDRSTRLEN, INET_ADDRSTRLEN)];
 
-                r = sd_bus_message_read(reply, "y", &family);
+                r = sd_bus_message_read(reply, "i", &family);
                 if (r < 0)
                         return bus_log_parse_error(r);
 
@@ -376,6 +376,8 @@ static int map_netif(sd_bus *bus, const char *member, sd_bus_message *m, sd_bus_
         r = sd_bus_message_read_array(m, SD_BUS_TYPE_INT32, &v, &l);
         if (r < 0)
                 return r;
+        if (r == 0)
+                return -EBADMSG;
 
         i->n_netif = l / sizeof(int32_t);
         i->netif = memdup(v, l);
@@ -659,7 +661,7 @@ static int openpt_in_namespace(pid_t pid, int flags) {
 static int login_machine(sd_bus *bus, char **args, unsigned n) {
         _cleanup_bus_message_unref_ sd_bus_message *reply = NULL, *reply2 = NULL, *reply3 = NULL;
         _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
-        _cleanup_bus_unref_ sd_bus *container_bus = NULL;
+        _cleanup_bus_close_unref_ sd_bus *container_bus = NULL;
         _cleanup_close_ int master = -1;
         _cleanup_free_ char *getty = NULL;
         const char *path, *pty, *p;
@@ -777,8 +779,7 @@ static int login_machine(sd_bus *bus, char **args, unsigned n) {
         return 0;
 }
 
-static int help(void) {
-
+static void help(void) {
         printf("%s [OPTIONS...] {COMMAND} ...\n\n"
                "Send control commands to or query the virtual machine and container registration manager.\n\n"
                "  -h --help              Show this help\n"
@@ -802,8 +803,6 @@ static int help(void) {
                "  kill NAME...           Send signal to processes of a VM/container\n"
                "  terminate NAME...      Terminate one or more VMs/containers\n",
                program_invocation_short_name);
-
-        return 0;
 }
 
 static int parse_argv(int argc, char *argv[]) {
@@ -835,12 +834,13 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "hp:als:H:M:", options, NULL)) >= 0) {
+        while ((c = getopt_long(argc, argv, "hp:als:H:M:", options, NULL)) >= 0)
 
                 switch (c) {
 
                 case 'h':
-                        return help();
+                        help();
+                        return 0;
 
                 case ARG_VERSION:
                         puts(PACKAGE_STRING);
@@ -902,7 +902,6 @@ static int parse_argv(int argc, char *argv[]) {
                 default:
                         assert_not_reached("Unhandled option");
                 }
-        }
 
         return 1;
 }
@@ -990,7 +989,7 @@ static int machinectl_main(sd_bus *bus, int argc, char *argv[]) {
 }
 
 int main(int argc, char*argv[]) {
-        _cleanup_bus_unref_ sd_bus *bus = NULL;
+        _cleanup_bus_close_unref_ sd_bus *bus = NULL;
         int r;
 
         setlocale(LC_ALL, "");

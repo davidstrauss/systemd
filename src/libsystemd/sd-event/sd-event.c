@@ -43,6 +43,7 @@
 typedef enum EventSourceType {
         SOURCE_IO,
         SOURCE_TIME_REALTIME,
+        SOURCE_TIME_BOOTTIME,
         SOURCE_TIME_MONOTONIC,
         SOURCE_TIME_REALTIME_ALARM,
         SOURCE_TIME_BOOTTIME_ALARM,
@@ -56,7 +57,7 @@ typedef enum EventSourceType {
         _SOURCE_EVENT_SOURCE_TYPE_INVALID = -1
 } EventSourceType;
 
-#define EVENT_SOURCE_IS_TIME(t) IN_SET((t), SOURCE_TIME_REALTIME, SOURCE_TIME_MONOTONIC, SOURCE_TIME_REALTIME_ALARM, SOURCE_TIME_BOOTTIME_ALARM)
+#define EVENT_SOURCE_IS_TIME(t) IN_SET((t), SOURCE_TIME_REALTIME, SOURCE_TIME_BOOTTIME, SOURCE_TIME_MONOTONIC, SOURCE_TIME_REALTIME_ALARM, SOURCE_TIME_BOOTTIME_ALARM)
 
 struct sd_event_source {
         unsigned n_ref;
@@ -64,6 +65,8 @@ struct sd_event_source {
         sd_event *event;
         void *userdata;
         sd_event_handler_t prepare;
+
+        char *name;
 
         EventSourceType type:5;
         int enabled:3;
@@ -130,6 +133,8 @@ struct clock_data {
         Prioq *earliest;
         Prioq *latest;
         usec_t next;
+
+        bool needs_rearm:1;
 };
 
 struct sd_event {
@@ -142,10 +147,11 @@ struct sd_event {
         Prioq *pending;
         Prioq *prepare;
 
-        /* timerfd_create() only supports these four clocks so far. We
+        /* timerfd_create() only supports these five clocks so far. We
          * can add support for more clocks when the kernel learns to
          * deal with them, too. */
         struct clock_data realtime;
+        struct clock_data boottime;
         struct clock_data monotonic;
         struct clock_data realtime_alarm;
         struct clock_data boottime_alarm;
@@ -377,6 +383,7 @@ static void event_free(sd_event *e) {
         safe_close(e->watchdog_fd);
 
         free_clock_data(&e->realtime);
+        free_clock_data(&e->boottime);
         free_clock_data(&e->monotonic);
         free_clock_data(&e->realtime_alarm);
         free_clock_data(&e->boottime_alarm);
@@ -403,10 +410,10 @@ _public_ int sd_event_new(sd_event** ret) {
                 return -ENOMEM;
 
         e->n_ref = 1;
-        e->signal_fd = e->watchdog_fd = e->epoll_fd = e->realtime.fd = e->monotonic.fd = e->realtime_alarm.fd = e->boottime_alarm.fd = -1;
-        e->realtime.next = e->monotonic.next = e->realtime_alarm.next = e->boottime_alarm.next = (usec_t) -1;
+        e->signal_fd = e->watchdog_fd = e->epoll_fd = e->realtime.fd = e->boottime.fd = e->monotonic.fd = e->realtime_alarm.fd = e->boottime_alarm.fd = -1;
+        e->realtime.next = e->boottime.next = e->monotonic.next = e->realtime_alarm.next = e->boottime_alarm.next = USEC_INFINITY;
         e->original_pid = getpid();
-        e->perturb = (usec_t) -1;
+        e->perturb = USEC_INFINITY;
 
         assert_se(sigemptyset(&e->sigset) == 0);
 
@@ -517,6 +524,9 @@ static clockid_t event_source_type_to_clock(EventSourceType t) {
         case SOURCE_TIME_REALTIME:
                 return CLOCK_REALTIME;
 
+        case SOURCE_TIME_BOOTTIME:
+                return CLOCK_BOOTTIME;
+
         case SOURCE_TIME_MONOTONIC:
                 return CLOCK_MONOTONIC;
 
@@ -537,6 +547,9 @@ static EventSourceType clock_to_event_source_type(clockid_t clock) {
 
         case CLOCK_REALTIME:
                 return SOURCE_TIME_REALTIME;
+
+        case CLOCK_BOOTTIME:
+                return SOURCE_TIME_BOOTTIME;
 
         case CLOCK_MONOTONIC:
                 return SOURCE_TIME_MONOTONIC;
@@ -559,6 +572,9 @@ static struct clock_data* event_get_clock_data(sd_event *e, EventSourceType t) {
 
         case SOURCE_TIME_REALTIME:
                 return &e->realtime;
+
+        case SOURCE_TIME_BOOTTIME:
+                return &e->boottime;
 
         case SOURCE_TIME_MONOTONIC:
                 return &e->monotonic;
@@ -593,6 +609,7 @@ static void source_disconnect(sd_event_source *s) {
                 break;
 
         case SOURCE_TIME_REALTIME:
+        case SOURCE_TIME_BOOTTIME:
         case SOURCE_TIME_MONOTONIC:
         case SOURCE_TIME_REALTIME_ALARM:
         case SOURCE_TIME_BOOTTIME_ALARM: {
@@ -603,6 +620,7 @@ static void source_disconnect(sd_event_source *s) {
 
                 prioq_remove(d->earliest, s, &s->time.earliest_index);
                 prioq_remove(d->latest, s, &s->time.latest_index);
+                d->needs_rearm = true;
                 break;
         }
 
@@ -669,6 +687,7 @@ static void source_free(sd_event_source *s) {
         assert(s);
 
         source_disconnect(s);
+        free(s->name);
         free(s);
 }
 
@@ -702,6 +721,7 @@ static int source_set_pending(sd_event_source *s, bool b) {
 
                 prioq_reshuffle(d->earliest, s, &s->time.earliest_index);
                 prioq_reshuffle(d->latest, s, &s->time.latest_index);
+                d->needs_rearm = true;
         }
 
         return 0;
@@ -762,7 +782,7 @@ _public_ int sd_event_add_io(
         r = source_io_register(s, s->enabled, events);
         if (r < 0) {
                 source_free(s);
-                return -errno;
+                return r;
         }
 
         if (ret)
@@ -783,7 +803,7 @@ static void initialize_perturb(sd_event *e) {
            bit. Here, we calculate a perturbation usec offset from the
            boot ID. */
 
-        if (_likely_(e->perturb != (usec_t) -1))
+        if (_likely_(e->perturb != USEC_INFINITY))
                 return;
 
         if (sd_id128_get_boot(&bootid) >= 0)
@@ -876,6 +896,8 @@ _public_ int sd_event_add_time(
         s->time.earliest_index = s->time.latest_index = PRIOQ_IDX_NULL;
         s->userdata = userdata;
         s->enabled = SD_EVENT_ONESHOT;
+
+        d->needs_rearm = true;
 
         r = prioq_put(d->earliest, s, &s->time.earliest_index);
         if (r < 0)
@@ -1041,7 +1063,7 @@ _public_ int sd_event_add_child(
                 r = event_update_signal_fd(e);
                 if (r < 0) {
                         source_free(s);
-                        return -errno;
+                        return r;
                 }
         }
 
@@ -1202,6 +1224,21 @@ _public_ sd_event_source* sd_event_source_unref(sd_event_source *s) {
         }
 
         return NULL;
+}
+
+_public_ int sd_event_source_set_name(sd_event_source *s, const char *name) {
+        assert_return(s, -EINVAL);
+
+        return free_and_strdup(&s->name, name);
+}
+
+_public_ int sd_event_source_get_name(sd_event_source *s, const char **name) {
+        assert_return(s, -EINVAL);
+        assert_return(name, -EINVAL);
+
+        *name = s->name;
+
+        return 0;
 }
 
 _public_ sd_event *sd_event_source_get_event(sd_event_source *s) {
@@ -1383,6 +1420,7 @@ _public_ int sd_event_source_set_enabled(sd_event_source *s, int m) {
                         break;
 
                 case SOURCE_TIME_REALTIME:
+                case SOURCE_TIME_BOOTTIME:
                 case SOURCE_TIME_MONOTONIC:
                 case SOURCE_TIME_REALTIME_ALARM:
                 case SOURCE_TIME_BOOTTIME_ALARM: {
@@ -1394,6 +1432,7 @@ _public_ int sd_event_source_set_enabled(sd_event_source *s, int m) {
 
                         prioq_reshuffle(d->earliest, s, &s->time.earliest_index);
                         prioq_reshuffle(d->latest, s, &s->time.latest_index);
+                        d->needs_rearm = true;
                         break;
                 }
 
@@ -1445,6 +1484,7 @@ _public_ int sd_event_source_set_enabled(sd_event_source *s, int m) {
                         break;
 
                 case SOURCE_TIME_REALTIME:
+                case SOURCE_TIME_BOOTTIME:
                 case SOURCE_TIME_MONOTONIC:
                 case SOURCE_TIME_REALTIME_ALARM:
                 case SOURCE_TIME_BOOTTIME_ALARM: {
@@ -1456,6 +1496,7 @@ _public_ int sd_event_source_set_enabled(sd_event_source *s, int m) {
 
                         prioq_reshuffle(d->earliest, s, &s->time.earliest_index);
                         prioq_reshuffle(d->latest, s, &s->time.latest_index);
+                        d->needs_rearm = true;
                         break;
                 }
 
@@ -1533,6 +1574,7 @@ _public_ int sd_event_source_set_time(sd_event_source *s, uint64_t usec) {
 
         prioq_reshuffle(d->earliest, s, &s->time.earliest_index);
         prioq_reshuffle(d->latest, s, &s->time.latest_index);
+        d->needs_rearm = true;
 
         return 0;
 }
@@ -1567,6 +1609,7 @@ _public_ int sd_event_source_set_time_accuracy(sd_event_source *s, uint64_t usec
         assert(d);
 
         prioq_reshuffle(d->latest, s, &s->time.latest_index);
+        d->needs_rearm = true;
 
         return 0;
 }
@@ -1730,13 +1773,18 @@ static int event_arm_timer(
         assert(e);
         assert(d);
 
+        if (!d->needs_rearm)
+                return 0;
+        else
+                d->needs_rearm = false;
+
         a = prioq_peek(d->earliest);
         if (!a || a->enabled == SD_EVENT_OFF) {
 
                 if (d->fd < 0)
                         return 0;
 
-                if (d->next == (usec_t) -1)
+                if (d->next == USEC_INFINITY)
                         return 0;
 
                 /* disarm */
@@ -1744,7 +1792,7 @@ static int event_arm_timer(
                 if (r < 0)
                         return r;
 
-                d->next = (usec_t) -1;
+                d->next = USEC_INFINITY;
                 return 0;
         }
 
@@ -1812,7 +1860,7 @@ static int flush_timer(sd_event *e, int fd, uint32_t events, usec_t *next) {
                 return -EIO;
 
         if (next)
-                *next = (usec_t) -1;
+                *next = USEC_INFINITY;
 
         return 0;
 }
@@ -1842,6 +1890,7 @@ static int process_timer(
 
                 prioq_reshuffle(d->earliest, s, &s->time.earliest_index);
                 prioq_reshuffle(d->latest, s, &s->time.latest_index);
+                d->needs_rearm = true;
         }
 
         return 0;
@@ -2005,6 +2054,7 @@ static int source_dispatch(sd_event_source *s) {
                 break;
 
         case SOURCE_TIME_REALTIME:
+        case SOURCE_TIME_BOOTTIME:
         case SOURCE_TIME_MONOTONIC:
         case SOURCE_TIME_REALTIME_ALARM:
         case SOURCE_TIME_BOOTTIME_ALARM:
@@ -2051,8 +2101,12 @@ static int source_dispatch(sd_event_source *s) {
 
         s->dispatching = false;
 
-        if (r < 0)
-                log_debug("Event source %p returned error, disabling: %s", s, strerror(-r));
+        if (r < 0) {
+                if (s->name)
+                        log_debug("Event source '%s' returned error, disabling: %s", s->name, strerror(-r));
+                else
+                        log_debug("Event source %p returned error, disabling: %s", s, strerror(-r));
+        }
 
         if (s->n_ref == 0)
                 source_free(s);
@@ -2085,8 +2139,12 @@ static int event_prepare(sd_event *e) {
                 r = s->prepare(s, s->userdata);
                 s->dispatching = false;
 
-                if (r < 0)
-                        log_debug("Prepare callback of event source %p returned error, disabling: %s", s, strerror(-r));
+                if (r < 0) {
+                        if (s->name)
+                                log_debug("Prepare callback of event source '%s' returned error, disabling: %s", s->name, strerror(-r));
+                        else
+                                log_debug("Prepare callback of event source %p returned error, disabling: %s", s, strerror(-r));
+                }
 
                 if (s->n_ref == 0)
                         source_free(s);
@@ -2178,12 +2236,8 @@ static int process_watchdog(sd_event *e) {
         return arm_watchdog(e);
 }
 
-_public_ int sd_event_run(sd_event *e, uint64_t timeout) {
-        struct epoll_event *ev_queue;
-        unsigned ev_queue_max;
-        sd_event_source *p;
-        int r, i, m;
-        bool timedout;
+_public_ int sd_event_prepare(sd_event *e) {
+        int r;
 
         assert_return(e, -EINVAL);
         assert_return(!event_pid_changed(e), -ECHILD);
@@ -2191,34 +2245,64 @@ _public_ int sd_event_run(sd_event *e, uint64_t timeout) {
         assert_return(e->state == SD_EVENT_PASSIVE, -EBUSY);
 
         if (e->exit_requested)
-                return dispatch_exit(e);
+                goto pending;
 
-        sd_event_ref(e);
         e->iteration++;
-        e->state = SD_EVENT_RUNNING;
 
         r = event_prepare(e);
         if (r < 0)
-                goto finish;
+                return r;
 
         r = event_arm_timer(e, &e->realtime);
         if (r < 0)
-                goto finish;
+                return r;
+
+        r = event_arm_timer(e, &e->boottime);
+        if (r < 0)
+                return r;
 
         r = event_arm_timer(e, &e->monotonic);
         if (r < 0)
-                goto finish;
+                return r;
 
         r = event_arm_timer(e, &e->realtime_alarm);
         if (r < 0)
-                goto finish;
+                return r;
 
         r = event_arm_timer(e, &e->boottime_alarm);
         if (r < 0)
-                goto finish;
+                return r;
 
         if (event_next_pending(e) || e->need_process_child)
-                timeout = 0;
+                goto pending;
+
+        e->state = SD_EVENT_PREPARED;
+
+        return 0;
+
+pending:
+        e->state = SD_EVENT_PREPARED;
+        r = sd_event_wait(e, 0);
+        if (r == 0)
+                e->state = SD_EVENT_PREPARED;
+
+        return r;
+}
+
+_public_ int sd_event_wait(sd_event *e, uint64_t timeout) {
+        struct epoll_event *ev_queue;
+        unsigned ev_queue_max;
+        int r, m, i;
+
+        assert_return(e, -EINVAL);
+        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(e->state != SD_EVENT_FINISHED, -ESTALE);
+        assert_return(e->state == SD_EVENT_PREPARED, -EBUSY);
+
+        if (e->exit_requested) {
+                e->state = SD_EVENT_PENDING;
+                return 1;
+        }
 
         ev_queue_max = CLAMP(e->n_sources, 1U, EPOLL_QUEUE_MAX);
         ev_queue = newa(struct epoll_event, ev_queue_max);
@@ -2226,11 +2310,15 @@ _public_ int sd_event_run(sd_event *e, uint64_t timeout) {
         m = epoll_wait(e->epoll_fd, ev_queue, ev_queue_max,
                        timeout == (uint64_t) -1 ? -1 : (int) ((timeout + USEC_PER_MSEC - 1) / USEC_PER_MSEC));
         if (m < 0) {
-                r = errno == EAGAIN || errno == EINTR ? 1 : -errno;
+                if (errno == EINTR) {
+                        e->state = SD_EVENT_PENDING;
+                        return 1;
+                }
+
+                r = -errno;
+
                 goto finish;
         }
-
-        timedout = m == 0;
 
         dual_timestamp_get(&e->timestamp);
         e->timestamp_boottime = now(CLOCK_BOOTTIME);
@@ -2239,6 +2327,8 @@ _public_ int sd_event_run(sd_event *e, uint64_t timeout) {
 
                 if (ev_queue[i].data.ptr == INT_TO_PTR(SOURCE_TIME_REALTIME))
                         r = flush_timer(e, e->realtime.fd, ev_queue[i].events, &e->realtime.next);
+                else if (ev_queue[i].data.ptr == INT_TO_PTR(SOURCE_TIME_BOOTTIME))
+                        r = flush_timer(e, e->boottime.fd, ev_queue[i].events, &e->boottime.next);
                 else if (ev_queue[i].data.ptr == INT_TO_PTR(SOURCE_TIME_MONOTONIC))
                         r = flush_timer(e, e->monotonic.fd, ev_queue[i].events, &e->monotonic.next);
                 else if (ev_queue[i].data.ptr == INT_TO_PTR(SOURCE_TIME_REALTIME_ALARM))
@@ -2264,6 +2354,10 @@ _public_ int sd_event_run(sd_event *e, uint64_t timeout) {
         if (r < 0)
                 goto finish;
 
+        r = process_timer(e, e->timestamp_boottime, &e->boottime);
+        if (r < 0)
+                goto finish;
+
         r = process_timer(e, e->timestamp.monotonic, &e->monotonic);
         if (r < 0)
                 goto finish;
@@ -2282,19 +2376,69 @@ _public_ int sd_event_run(sd_event *e, uint64_t timeout) {
                         goto finish;
         }
 
-        p = event_next_pending(e);
-        if (!p) {
-                r = !timedout;
-                goto finish;
+        if (event_next_pending(e)) {
+                e->state = SD_EVENT_PENDING;
+
+                return 1;
         }
 
-        r = source_dispatch(p);
+        r = 0;
 
 finish:
         e->state = SD_EVENT_PASSIVE;
-        sd_event_unref(e);
 
         return r;
+}
+
+_public_ int sd_event_dispatch(sd_event *e) {
+        sd_event_source *p;
+        int r;
+
+        assert_return(e, -EINVAL);
+        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(e->state != SD_EVENT_FINISHED, -ESTALE);
+        assert_return(e->state == SD_EVENT_PENDING, -EBUSY);
+
+        if (e->exit_requested)
+                return dispatch_exit(e);
+
+        p = event_next_pending(e);
+        if (p) {
+                sd_event_ref(e);
+
+                e->state = SD_EVENT_RUNNING;
+                r = source_dispatch(p);
+                e->state = SD_EVENT_PASSIVE;
+
+                sd_event_unref(e);
+
+                return r;
+        }
+
+        e->state = SD_EVENT_PASSIVE;
+
+        return 1;
+}
+
+_public_ int sd_event_run(sd_event *e, uint64_t timeout) {
+        int r;
+
+        assert_return(e, -EINVAL);
+        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(e->state != SD_EVENT_FINISHED, -ESTALE);
+        assert_return(e->state == SD_EVENT_PASSIVE, -EBUSY);
+
+        r = sd_event_prepare(e);
+        if (r > 0)
+                return sd_event_dispatch(e);
+        else if (r < 0)
+                return r;
+
+        r = sd_event_wait(e, timeout);
+        if (r > 0)
+                return sd_event_dispatch(e);
+        else
+                return r;
 }
 
 _public_ int sd_event_loop(sd_event *e) {
@@ -2317,6 +2461,14 @@ _public_ int sd_event_loop(sd_event *e) {
 finish:
         sd_event_unref(e);
         return r;
+}
+
+_public_ int sd_event_get_fd(sd_event *e) {
+
+        assert_return(e, -EINVAL);
+        assert_return(!event_pid_changed(e), -ECHILD);
+
+        return e->epoll_fd;
 }
 
 _public_ int sd_event_get_state(sd_event *e) {
@@ -2369,6 +2521,7 @@ _public_ int sd_event_now(sd_event *e, clockid_t clock, uint64_t *usec) {
                 *usec = e->timestamp.monotonic;
                 break;
 
+        case CLOCK_BOOTTIME:
         case CLOCK_BOOTTIME_ALARM:
                 *usec = e->timestamp_boottime;
                 break;

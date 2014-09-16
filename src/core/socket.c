@@ -180,9 +180,8 @@ static int socket_arm_timer(Socket *s) {
                         socket_dispatch_timer, s);
 }
 
-static int socket_instantiate_service(Socket *s) {
-        _cleanup_free_ char *prefix = NULL;
-        _cleanup_free_ char *name = NULL;
+int socket_instantiate_service(Socket *s) {
+        _cleanup_free_ char *prefix = NULL, *name = NULL;
         int r;
         Unit *u;
 
@@ -193,10 +192,8 @@ static int socket_instantiate_service(Socket *s) {
          * here. For Accept=no this is mostly a NOP since the service
          * is figured out at load time anyway. */
 
-        if (UNIT_DEREF(s->service))
+        if (UNIT_DEREF(s->service) || !s->accept)
                 return 0;
-
-        assert(s->accept);
 
         prefix = unit_name_to_prefix(UNIT(s)->id);
         if (!prefix)
@@ -465,6 +462,7 @@ _const_ static const char* listen_lookup(int family, int type) {
 }
 
 static void socket_dump(Unit *u, FILE *f, const char *prefix) {
+        char time_string[FORMAT_TIMESPAN_MAX];
         SocketExecCommand c;
         Socket *s = SOCKET(u);
         SocketPort *p;
@@ -473,6 +471,7 @@ static void socket_dump(Unit *u, FILE *f, const char *prefix) {
         assert(s);
         assert(f);
 
+        prefix = strempty(prefix);
         prefix2 = strappenda(prefix, "\t");
 
         fprintf(f,
@@ -483,6 +482,7 @@ static void socket_dump(Unit *u, FILE *f, const char *prefix) {
                 "%sSocketMode: %04o\n"
                 "%sDirectoryMode: %04o\n"
                 "%sKeepAlive: %s\n"
+                "%sNoDelay: %s\n"
                 "%sFreeBind: %s\n"
                 "%sTransparent: %s\n"
                 "%sBroadcast: %s\n"
@@ -497,6 +497,7 @@ static void socket_dump(Unit *u, FILE *f, const char *prefix) {
                 prefix, s->socket_mode,
                 prefix, s->directory_mode,
                 prefix, yes_no(s->keep_alive),
+                prefix, yes_no(s->no_delay),
                 prefix, yes_no(s->free_bind),
                 prefix, yes_no(s->transparent),
                 prefix, yes_no(s->broadcast),
@@ -595,6 +596,26 @@ static void socket_dump(Unit *u, FILE *f, const char *prefix) {
                         "%sOwnerGroup: %s\n",
                         prefix, strna(s->user),
                         prefix, strna(s->group));
+
+        if (s->keep_alive_time > 0)
+                fprintf(f,
+                        "%sKeepAliveTimeSec: %s\n",
+                        prefix, format_timespan(time_string, FORMAT_TIMESPAN_MAX, s->keep_alive_time, USEC_PER_SEC));
+
+        if (s->keep_alive_interval)
+                fprintf(f,
+                        "%sKeepAliveIntervalSec: %s\n",
+                        prefix, format_timespan(time_string, FORMAT_TIMESPAN_MAX, s->keep_alive_interval, USEC_PER_SEC));
+
+        if (s->keep_alive_cnt)
+                fprintf(f,
+                        "%sKeepAliveProbes: %u\n",
+                        prefix, s->keep_alive_cnt);
+
+        if (s->defer_accept)
+                fprintf(f,
+                        "%sDeferAcceptSec: %s\n",
+                        prefix, format_timespan(time_string, FORMAT_TIMESPAN_MAX, s->defer_accept, USEC_PER_SEC));
 
         LIST_FOREACH(port, p, s->ports) {
 
@@ -791,6 +812,36 @@ static void socket_apply_socket_options(Socket *s, int fd) {
                 int b = s->keep_alive;
                 if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &b, sizeof(b)) < 0)
                         log_warning_unit(UNIT(s)->id, "SO_KEEPALIVE failed: %m");
+        }
+
+        if (s->keep_alive_time) {
+                int value = s->keep_alive_time / USEC_PER_SEC;
+                if (setsockopt(fd, SOL_TCP, TCP_KEEPIDLE, &value, sizeof(value)) < 0)
+                        log_warning_unit(UNIT(s)->id, "TCP_KEEPIDLE failed: %m");
+        }
+
+        if (s->keep_alive_interval) {
+                int value =  s->keep_alive_interval / USEC_PER_SEC;
+                if (setsockopt(fd, SOL_TCP, TCP_KEEPINTVL, &value, sizeof(value)) < 0)
+                        log_warning_unit(UNIT(s)->id, "TCP_KEEPINTVL failed: %m");
+        }
+
+        if (s->keep_alive_cnt) {
+                int value = s->keep_alive_cnt;
+                if (setsockopt(fd, SOL_SOCKET, TCP_KEEPCNT, &value, sizeof(value)) < 0)
+                        log_warning_unit(UNIT(s)->id, "TCP_KEEPCNT failed: %m");
+        }
+
+        if (s->defer_accept) {
+                int value = s->defer_accept / USEC_PER_SEC;
+                if (setsockopt(fd, SOL_TCP, TCP_DEFER_ACCEPT, &value, sizeof(value)) < 0)
+                        log_warning_unit(UNIT(s)->id, "TCP_DEFER_ACCEPT failed: %m");
+        }
+
+        if (s->no_delay) {
+                int b = s->no_delay;
+                if (setsockopt(fd, SOL_TCP, TCP_NODELAY, &b, sizeof(b)) < 0)
+                        log_warning_unit(UNIT(s)->id, "TCP_NODELAY failed: %m");
         }
 
         if (s->broadcast) {
@@ -1307,6 +1358,11 @@ static int socket_spawn(Socket *s, ExecCommand *c, pid_t *_pid) {
         _cleanup_free_ char **argv = NULL;
         pid_t pid;
         int r;
+        ExecParameters exec_params = {
+                .apply_permissions = true,
+                .apply_chroot      = true,
+                .apply_tty_stdin   = true,
+        };
 
         assert(s);
         assert(c);
@@ -1326,21 +1382,17 @@ static int socket_spawn(Socket *s, ExecCommand *c, pid_t *_pid) {
         if (r < 0)
                 goto fail;
 
+        exec_params.argv = argv;
+        exec_params.environment = UNIT(s)->manager->environment;
+        exec_params.confirm_spawn = UNIT(s)->manager->confirm_spawn;
+        exec_params.cgroup_supported = UNIT(s)->manager->cgroup_supported;
+        exec_params.cgroup_path = UNIT(s)->cgroup_path;
+        exec_params.runtime_prefix = manager_get_runtime_prefix(UNIT(s)->manager);
+        exec_params.unit_id = UNIT(s)->id;
+
         r = exec_spawn(c,
-                       argv,
                        &s->exec_context,
-                       NULL, 0,
-                       UNIT(s)->manager->environment,
-                       true,
-                       true,
-                       true,
-                       UNIT(s)->manager->confirm_spawn,
-                       UNIT(s)->manager->cgroup_supported,
-                       UNIT(s)->cgroup_path,
-                       manager_get_runtime_prefix(UNIT(s)->manager),
-                       UNIT(s)->id,
-                       0,
-                       NULL,
+                       &exec_params,
                        s->exec_runtime,
                        &pid);
         if (r < 0)

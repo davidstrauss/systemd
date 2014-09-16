@@ -79,35 +79,35 @@ static void test_path(void) {
                 char p2[] = "//aaa/.////ccc";
                 char p3[] = "/./";
 
-                assert(path_equal(path_kill_slashes(p1), "aaa/bbb/ccc"));
-                assert(path_equal(path_kill_slashes(p2), "/aaa/./ccc"));
-                assert(path_equal(path_kill_slashes(p3), "/./"));
+                assert_se(path_equal(path_kill_slashes(p1), "aaa/bbb/ccc"));
+                assert_se(path_equal(path_kill_slashes(p2), "/aaa/./ccc"));
+                assert_se(path_equal(path_kill_slashes(p3), "/./"));
         }
 }
 
 static void test_find_binary(const char *self) {
         char *p;
 
-        assert(find_binary("/bin/sh", &p) == 0);
+        assert_se(find_binary("/bin/sh", &p) == 0);
         puts(p);
-        assert(streq(p, "/bin/sh"));
+        assert_se(streq(p, "/bin/sh"));
         free(p);
 
-        assert(find_binary(self, &p) == 0);
+        assert_se(find_binary(self, &p) == 0);
         puts(p);
-        assert(endswith(p, "/test-path-util"));
-        assert(path_is_absolute(p));
+        assert_se(endswith(p, "/test-path-util"));
+        assert_se(path_is_absolute(p));
         free(p);
 
-        assert(find_binary("sh", &p) == 0);
+        assert_se(find_binary("sh", &p) == 0);
         puts(p);
-        assert(endswith(p, "/sh"));
-        assert(path_is_absolute(p));
+        assert_se(endswith(p, "/sh"));
+        assert_se(path_is_absolute(p));
         free(p);
 
-        assert(find_binary("xxxx-xxxx", &p) == -ENOENT);
+        assert_se(find_binary("xxxx-xxxx", &p) == -ENOENT);
 
-        assert(find_binary("/some/dir/xxxx-xxxx", &p) == -ENOENT);
+        assert_se(find_binary("/some/dir/xxxx-xxxx", &p) == -ENOENT);
 }
 
 static void test_prefixes(void) {
@@ -156,10 +156,24 @@ static void test_prefixes(void) {
 
         b = false;
         PATH_FOREACH_PREFIX_MORE(s, "") {
-                assert(!b);
-                assert(streq(s, ""));
+                assert_se(!b);
+                assert_se(streq(s, ""));
                 b = true;
         }
+}
+
+static void test_path_join(void) {
+        assert_se(streq(path_join("/root", "/a/b", "/c"), "/root/a/b/c"));
+        assert_se(streq(path_join("/root", "a/b", "c"), "/root/a/b/c"));
+        assert_se(streq(path_join("/root", "/a/b", "c"), "/root/a/b/c"));
+        assert_se(streq(path_join("/root", "/", "c"), "/root//c"));
+        assert_se(streq(path_join("/root", "/", NULL), "/root/"));
+
+        assert_se(streq(path_join(NULL, "/a/b", "/c"), "/a/b/c"));
+        assert_se(streq(path_join(NULL, "a/b", "c"), "a/b/c"));
+        assert_se(streq(path_join(NULL, "/a/b", "c"), "/a/b/c"));
+        assert_se(streq(path_join(NULL, "/", "c"), "//c"));
+        assert_se(streq(path_join(NULL, "/", NULL), "/"));
 }
 
 static void test_fsck_exists(void) {
@@ -225,6 +239,7 @@ int main(int argc, char **argv) {
         test_path();
         test_find_binary(argv[0]);
         test_prefixes();
+        test_path_join();
         test_fsck_exists();
         test_make_relative();
         test_strv_resolve();

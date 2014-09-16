@@ -291,14 +291,14 @@ int machine_load(Machine *m) {
 
         if (netif) {
                 size_t l, allocated = 0, nr = 0;
-                char *w, *state;
+                const char *word, *state;
                 int *ni = NULL;
 
-                FOREACH_WORD(w, l, netif, state) {
+                FOREACH_WORD(word, l, netif, state) {
                         char buf[l+1];
                         int ifi;
 
-                        *(char*) (mempcpy(buf, w, l)) = 0;
+                        *(char*) (mempcpy(buf, word, l)) = 0;
 
                         if (safe_atoi(buf, &ifi) < 0)
                                 continue;
@@ -493,6 +493,8 @@ int machine_kill(Machine *m, KillWho who, int signo) {
 
                 if (kill(m->leader, signo) < 0)
                         return -errno;
+
+                return 0;
         }
 
         /* Otherwise make PID 1 do it for us, for the entire cgroup */

@@ -69,6 +69,8 @@ const UnitVTable * const unit_vtable[_UNIT_TYPE_MAX] = {
         [UNIT_SCOPE] = &scope_vtable
 };
 
+static int maybe_warn_about_dependency(const char *id, const char *other, UnitDependency dependency);
+
 Unit *unit_new(Manager *m, size_t size) {
         Unit *u;
 
@@ -583,7 +585,7 @@ static void merge_names(Unit *u, Unit *other) {
                 assert_se(hashmap_replace(u->manager->units, t, u) == 0);
 }
 
-static void merge_dependencies(Unit *u, Unit *other, UnitDependency d) {
+static void merge_dependencies(Unit *u, Unit *other, const char *other_id, UnitDependency d) {
         Iterator i;
         Unit *back;
         int r;
@@ -597,13 +599,24 @@ static void merge_dependencies(Unit *u, Unit *other, UnitDependency d) {
                 UnitDependency k;
 
                 for (k = 0; k < _UNIT_DEPENDENCY_MAX; k++) {
-                        r = set_remove_and_put(back->dependencies[k], other, u);
-                        if (r == -EEXIST)
-                                set_remove(back->dependencies[k], other);
-                        else
-                                assert(r >= 0 || r == -ENOENT);
+                        /* Do not add dependencies between u and itself */
+                        if (back == u) {
+                                if (set_remove(back->dependencies[k], other))
+                                        maybe_warn_about_dependency(u->id, other_id, k);
+                        } else {
+                                r = set_remove_and_put(back->dependencies[k], other, u);
+                                if (r == -EEXIST)
+                                        set_remove(back->dependencies[k], other);
+                                else
+                                        assert(r >= 0 || r == -ENOENT);
+                        }
                 }
         }
+
+        /* Also do not move dependencies on u to itself */
+        back = set_remove(other->dependencies[d], u);
+        if (back)
+                maybe_warn_about_dependency(u->id, other_id, d);
 
         complete_move(&u->dependencies[d], &other->dependencies[d]);
 
@@ -613,6 +626,7 @@ static void merge_dependencies(Unit *u, Unit *other, UnitDependency d) {
 
 int unit_merge(Unit *u, Unit *other) {
         UnitDependency d;
+        const char *other_id = NULL;
 
         assert(u);
         assert(other);
@@ -643,6 +657,9 @@ int unit_merge(Unit *u, Unit *other) {
         if (!UNIT_IS_INACTIVE_OR_FAILED(unit_active_state(other)))
                 return -EEXIST;
 
+        if (other->id)
+                other_id = strdupa(other->id);
+
         /* Merge names */
         merge_names(u, other);
 
@@ -652,7 +669,7 @@ int unit_merge(Unit *u, Unit *other) {
 
         /* Merge dependencies */
         for (d = 0; d < _UNIT_DEPENDENCY_MAX; d++)
-                merge_dependencies(u, other, d);
+                merge_dependencies(u, other, other_id, d);
 
         other->load_state = UNIT_MERGED;
         other->merged_into = u;
@@ -774,7 +791,6 @@ void unit_dump(Unit *u, FILE *f, const char *prefix) {
         char *t, **j;
         UnitDependency d;
         Iterator i;
-        _cleanup_free_ char *p2 = NULL;
         const char *prefix2;
         char
                 timestamp1[FORMAT_TIMESTAMP_MAX],
@@ -789,10 +805,8 @@ void unit_dump(Unit *u, FILE *f, const char *prefix) {
         assert(u);
         assert(u->type >= 0);
 
-        if (!prefix)
-                prefix = "";
-        p2 = strappend(prefix, "\t");
-        prefix2 = p2 ? p2 : prefix;
+        prefix = strempty(prefix);
+        prefix2 = strappenda(prefix, "\t");
 
         fprintf(f,
                 "%s-> Unit %s:\n"
@@ -1030,6 +1044,9 @@ static int unit_add_slice_dependencies(Unit *u) {
 
         if (UNIT_ISSET(u->slice))
                 return unit_add_two_dependencies(u, UNIT_AFTER, UNIT_WANTS, UNIT_DEREF(u->slice), true);
+
+        if (streq(u->id, SPECIAL_ROOT_SLICE))
+                return 0;
 
         return unit_add_two_dependencies_by_name(u, UNIT_AFTER, UNIT_WANTS, SPECIAL_ROOT_SLICE, NULL, true);
 }
@@ -1451,9 +1468,41 @@ static void unit_check_unneeded(Unit *u) {
                 if (unit_active_or_pending(other))
                         return;
 
-        log_info_unit(u->id, "Service %s is not needed anymore. Stopping.", u->id);
+        log_info_unit(u->id, "Unit %s is not needed anymore. Stopping.", u->id);
 
         /* Ok, nobody needs us anymore. Sniff. Then let's commit suicide */
+        manager_add_job(u->manager, JOB_STOP, u, JOB_FAIL, true, NULL, NULL);
+}
+
+static void unit_check_binds_to(Unit *u) {
+        bool stop = false;
+        Unit *other;
+        Iterator i;
+
+        assert(u);
+
+        if (u->job)
+                return;
+
+        if (unit_active_state(u) != UNIT_ACTIVE)
+                return;
+
+        SET_FOREACH(other, u->dependencies[UNIT_BINDS_TO], i) {
+                if (other->job)
+                        continue;
+
+                if (!UNIT_IS_INACTIVE_OR_FAILED(unit_active_state(other)))
+                        continue;
+
+                stop = true;
+        }
+
+        if (!stop)
+                return;
+
+        log_info_unit(u->id, "Unit %s is bound to inactive service. Stopping, too.", u->id);
+
+        /* A unit we need to run is gone. Sniff. Let's stop this. */
         manager_add_job(u->manager, JOB_STOP, u, JOB_FAIL, true, NULL, NULL);
 }
 
@@ -1599,9 +1648,9 @@ void unit_notify(Unit *u, UnitActiveState os, UnitActiveState ns, bool reload_su
         }
 
         /* Keep track of failed units */
-        if (ns == UNIT_FAILED && os != UNIT_FAILED)
+        if (ns == UNIT_FAILED)
                 set_put(u->manager->failed_units, u);
-        else if (os == UNIT_FAILED && ns != UNIT_FAILED)
+        else
                 set_remove(u->manager->failed_units, u);
 
         /* Make sure the cgroup is always removed when we become inactive */
@@ -1768,10 +1817,18 @@ void unit_notify(Unit *u, UnitActiveState os, UnitActiveState ns, bool reload_su
         manager_recheck_journal(m);
         unit_trigger_notify(u);
 
-        /* Maybe we finished startup and are now ready for being
-         * stopped because unneeded? */
-        if (u->manager->n_reloading <= 0)
+        if (u->manager->n_reloading <= 0) {
+                /* Maybe we finished startup and are now ready for
+                 * being stopped because unneeded? */
                 unit_check_unneeded(u);
+
+                /* Maybe we finished startup, but something we needed
+                 * has vanished? Let's die then. (This happens when
+                 * something BindsTo= to a Type=oneshot unit, as these
+                 * units go directly from starting to inactive,
+                 * without ever entering started.) */
+                unit_check_binds_to(u);
+        }
 
         unit_add_to_dbus_queue(u);
         unit_add_to_gc_queue(u);
@@ -1937,6 +1994,53 @@ bool unit_job_is_applicable(Unit *u, JobType j) {
         }
 }
 
+static int maybe_warn_about_dependency(const char *id, const char *other, UnitDependency dependency) {
+        assert(id);
+
+        switch (dependency) {
+        case UNIT_REQUIRES:
+        case UNIT_REQUIRES_OVERRIDABLE:
+        case UNIT_WANTS:
+        case UNIT_REQUISITE:
+        case UNIT_REQUISITE_OVERRIDABLE:
+        case UNIT_BINDS_TO:
+        case UNIT_PART_OF:
+        case UNIT_REQUIRED_BY:
+        case UNIT_REQUIRED_BY_OVERRIDABLE:
+        case UNIT_WANTED_BY:
+        case UNIT_BOUND_BY:
+        case UNIT_CONSISTS_OF:
+        case UNIT_REFERENCES:
+        case UNIT_REFERENCED_BY:
+        case UNIT_PROPAGATES_RELOAD_TO:
+        case UNIT_RELOAD_PROPAGATED_FROM:
+        case UNIT_JOINS_NAMESPACE_OF:
+                return 0;
+
+        case UNIT_CONFLICTS:
+        case UNIT_CONFLICTED_BY:
+        case UNIT_BEFORE:
+        case UNIT_AFTER:
+        case UNIT_ON_FAILURE:
+        case UNIT_TRIGGERS:
+        case UNIT_TRIGGERED_BY:
+                if (streq_ptr(id, other))
+                        log_warning_unit(id, "Dependency %s=%s dropped from unit %s",
+                                         unit_dependency_to_string(dependency), id, other);
+                else
+                        log_warning_unit(id, "Dependency %s=%s dropped from unit %s merged into %s",
+                                         unit_dependency_to_string(dependency), id,
+                                         strna(other), id);
+                return -EINVAL;
+
+        case _UNIT_DEPENDENCY_MAX:
+        case _UNIT_DEPENDENCY_INVALID:
+                break;
+        }
+
+        assert_not_reached("Invalid dependency type");
+}
+
 int unit_add_dependency(Unit *u, UnitDependency d, Unit *other, bool add_reference) {
 
         static const UnitDependency inverse_table[_UNIT_DEPENDENCY_MAX] = {
@@ -1966,6 +2070,7 @@ int unit_add_dependency(Unit *u, UnitDependency d, Unit *other, bool add_referen
                 [UNIT_JOINS_NAMESPACE_OF] = UNIT_JOINS_NAMESPACE_OF,
         };
         int r, q = 0, v = 0, w = 0;
+        Unit *orig_u = u, *orig_other = other;
 
         assert(u);
         assert(d >= 0 && d < _UNIT_DEPENDENCY_MAX);
@@ -1976,8 +2081,10 @@ int unit_add_dependency(Unit *u, UnitDependency d, Unit *other, bool add_referen
 
         /* We won't allow dependencies on ourselves. We will not
          * consider them an error however. */
-        if (u == other)
+        if (u == other) {
+                maybe_warn_about_dependency(orig_u->id, orig_other->id, d);
                 return 0;
+        }
 
         r = set_ensure_allocated(&u->dependencies[d], trivial_hash_func, trivial_compare_func);
         if (r < 0)
@@ -2044,10 +2151,12 @@ int unit_add_two_dependencies(Unit *u, UnitDependency d, UnitDependency e, Unit 
 
         assert(u);
 
-        if ((r = unit_add_dependency(u, d, other, add_reference)) < 0)
+        r = unit_add_dependency(u, d, other, add_reference);
+        if (r < 0)
                 return r;
 
-        if ((r = unit_add_dependency(u, e, other, add_reference)) < 0)
+        r = unit_add_dependency(u, e, other, add_reference);
+        if (r < 0)
                 return r;
 
         return 0;
@@ -2107,22 +2216,22 @@ int unit_add_dependency_by_name(Unit *u, UnitDependency d, const char *name, con
 }
 
 int unit_add_two_dependencies_by_name(Unit *u, UnitDependency d, UnitDependency e, const char *name, const char *path, bool add_reference) {
+        _cleanup_free_ char *s = NULL;
         Unit *other;
         int r;
-        _cleanup_free_ char *s = NULL;
 
         assert(u);
         assert(name || path);
 
-        if (!(name = resolve_template(u, name, path, &s)))
+        name = resolve_template(u, name, path, &s);
+        if (!name)
                 return -ENOMEM;
 
-        if ((r = manager_load_unit(u->manager, name, path, NULL, &other)) < 0)
+        r = manager_load_unit(u->manager, name, path, NULL, &other);
+        if (r < 0)
                 return r;
 
-        r = unit_add_two_dependencies(u, d, e, other, add_reference);
-
-        return r;
+        return unit_add_two_dependencies(u, d, e, other, add_reference);
 }
 
 int unit_add_dependency_by_name_inverse(Unit *u, UnitDependency d, const char *name, const char *path, bool add_reference) {
@@ -2133,15 +2242,15 @@ int unit_add_dependency_by_name_inverse(Unit *u, UnitDependency d, const char *n
         assert(u);
         assert(name || path);
 
-        if (!(name = resolve_template(u, name, path, &s)))
+        name = resolve_template(u, name, path, &s);
+        if (!name)
                 return -ENOMEM;
 
-        if ((r = manager_load_unit(u->manager, name, path, NULL, &other)) < 0)
+        r = manager_load_unit(u->manager, name, path, NULL, &other);
+        if (r < 0)
                 return r;
 
-        r = unit_add_dependency(other, d, u, add_reference);
-
-        return r;
+        return unit_add_dependency(other, d, u, add_reference);
 }
 
 int unit_add_two_dependencies_by_name_inverse(Unit *u, UnitDependency d, UnitDependency e, const char *name, const char *path, bool add_reference) {
@@ -2152,24 +2261,24 @@ int unit_add_two_dependencies_by_name_inverse(Unit *u, UnitDependency d, UnitDep
         assert(u);
         assert(name || path);
 
-        if (!(name = resolve_template(u, name, path, &s)))
+        name = resolve_template(u, name, path, &s);
+        if (!name)
                 return -ENOMEM;
 
-        if ((r = manager_load_unit(u->manager, name, path, NULL, &other)) < 0)
+        r = manager_load_unit(u->manager, name, path, NULL, &other);
+        if (r < 0)
                 return r;
 
-        if ((r = unit_add_two_dependencies(other, d, e, u, add_reference)) < 0)
+        r = unit_add_two_dependencies(other, d, e, u, add_reference);
+        if (r < 0)
                 return r;
 
         return r;
 }
 
 int set_unit_path(const char *p) {
-        _cleanup_free_ char *c = NULL;
-
         /* This is mostly for debug purposes */
-        c = path_make_absolute_cwd(p);
-        if (setenv("SYSTEMD_UNIT_PATH", c, 0) < 0)
+        if (setenv("SYSTEMD_UNIT_PATH", p, 0) < 0)
                 return -errno;
 
         return 0;
@@ -3316,7 +3425,7 @@ int unit_setup_exec_runtime(Unit *u) {
         offset = UNIT_VTABLE(u)->exec_runtime_offset;
         assert(offset > 0);
 
-        /* Check if ther already is an ExecRuntime for this unit? */
+        /* Check if there already is an ExecRuntime for this unit? */
         rt = (ExecRuntime**) ((uint8_t*) u + offset);
         if (*rt)
                 return 0;

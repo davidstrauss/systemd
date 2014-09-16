@@ -23,6 +23,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/utsname.h>
+#include <sys/capability.h>
 
 #include "util.h"
 #include "strv.h"
@@ -68,11 +69,11 @@ static void context_reset(Context *c) {
         }
 }
 
-static void context_free(Context *c, sd_bus *bus) {
+static void context_free(Context *c) {
         assert(c);
 
         context_reset(c);
-        bus_verify_polkit_async_registry_free(bus, c->polkit_registry);
+        bus_verify_polkit_async_registry_free(c->polkit_registry);
 }
 
 static int context_read_data(Context *c) {
@@ -425,7 +426,7 @@ static int method_set_hostname(sd_bus *bus, sd_bus_message *m, void *userdata, s
         if (streq_ptr(name, c->data[PROP_HOSTNAME]))
                 return sd_bus_reply_method_return(m, NULL);
 
-        r = bus_verify_polkit_async(bus, &c->polkit_registry, m, "org.freedesktop.hostname1.set-hostname", interactive, error, method_set_hostname, c);
+        r = bus_verify_polkit_async(m, CAP_SYS_ADMIN, "org.freedesktop.hostname1.set-hostname", interactive, &c->polkit_registry, error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -467,7 +468,7 @@ static int method_set_static_hostname(sd_bus *bus, sd_bus_message *m, void *user
         if (streq_ptr(name, c->data[PROP_STATIC_HOSTNAME]))
                 return sd_bus_reply_method_return(m, NULL);
 
-        r = bus_verify_polkit_async(bus, &c->polkit_registry, m, "org.freedesktop.hostname1.set-static-hostname", interactive, error, method_set_static_hostname, c);
+        r = bus_verify_polkit_async(m, CAP_SYS_ADMIN, "org.freedesktop.hostname1.set-static-hostname", interactive, &c->polkit_registry, error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -532,9 +533,10 @@ static int set_machine_info(Context *c, sd_bus *bus, sd_bus_message *m, int prop
          * same time as the static one, use the same policy action for
          * both... */
 
-        r = bus_verify_polkit_async(bus, &c->polkit_registry, m, prop == PROP_PRETTY_HOSTNAME ?
-                          "org.freedesktop.hostname1.set-static-hostname" :
-                          "org.freedesktop.hostname1.set-machine-info", interactive, error, cb, c);
+        r = bus_verify_polkit_async(m, CAP_SYS_ADMIN,
+                                    prop == PROP_PRETTY_HOSTNAME ?
+                                    "org.freedesktop.hostname1.set-static-hostname" :
+                                    "org.freedesktop.hostname1.set-machine-info", interactive, &c->polkit_registry, error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -634,7 +636,7 @@ static const sd_bus_vtable hostname_vtable[] = {
 };
 
 static int connect_bus(Context *c, sd_event *event, sd_bus **_bus) {
-        _cleanup_bus_unref_ sd_bus *bus = NULL;
+        _cleanup_bus_close_unref_ sd_bus *bus = NULL;
         int r;
 
         assert(c);
@@ -673,9 +675,8 @@ static int connect_bus(Context *c, sd_event *event, sd_bus **_bus) {
 
 int main(int argc, char *argv[]) {
         Context context = {};
-
         _cleanup_event_unref_ sd_event *event = NULL;
-        _cleanup_bus_unref_ sd_bus *bus = NULL;
+        _cleanup_bus_close_unref_ sd_bus *bus = NULL;
         int r;
 
         log_set_target(LOG_TARGET_AUTO);
@@ -722,7 +723,7 @@ int main(int argc, char *argv[]) {
         }
 
 finish:
-        context_free(&context, bus);
+        context_free(&context);
 
         return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }

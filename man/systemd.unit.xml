@@ -203,7 +203,12 @@
                 settings to a unit, without having to modify their
                 unit files. Make sure that the file that is included
                 has the appropriate section headers before any
-                directive.</para>
+                directive. Note that for instanced units this logic
+                will first look for the instance
+                <literal>.d/</literal> subdirectory and read its
+                <literal>.conf</literal> files, followed by the
+                template <literal>.d/</literal> subdirectory and reads
+                its <literal>.conf</literal> files.</para>
 
                 <para>Note that while systemd offers a flexible
                 dependency system between units it is recommended to
@@ -275,8 +280,10 @@
                 (<option>--user</option>) and the variable
                 <varname>$SYSTEMD_UNIT_PATH</varname> is set, this
                 contents of this variable overrides the unit load
-                path.
-                </para>
+                path. If <varname>$SYSTEMD_UNIT_PATH</varname> ends
+                with an empty component (<literal>:</literal>), the
+                usual unit load path will be appended to the contents
+                of the variable.</para>
 
                 <table>
                   <title>
@@ -996,6 +1003,7 @@
                                 virtualization solution, or one of
                                 <varname>qemu</varname>,
                                 <varname>kvm</varname>,
+                                <varname>zvm</varname>,
                                 <varname>vmware</varname>,
                                 <varname>microsoft</varname>,
                                 <varname>oracle</varname>,
@@ -1248,9 +1256,10 @@
         <refsect1>
                 <title>[Install] Section Options</title>
 
-                <para>Unit file may include a [Install] section, which
-                carries installation information for the unit. This
-                section is not interpreted by
+                <para>Unit file may include an
+                <literal>[Install]</literal> section, which carries
+                installation information for the unit. This section is
+                not interpreted by
                 <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>
                 during runtime. It is used exclusively by the
                 <command>enable</command> and
@@ -1262,7 +1271,7 @@
                         <varlistentry>
                                 <term><varname>Alias=</varname></term>
 
-                                <listitem><para>A space-seperated list
+                                <listitem><para>A space-separated list
                                 of additional names this unit shall be
                                 installed under. The names listed here
                                 must have the same suffix (i.e. type)
@@ -1495,7 +1504,7 @@
                 <title>See Also</title>
                 <para>
                         <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-                        <citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
+                        <citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
                         <citerefentry><refentrytitle>systemd.special</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
                         <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
                         <citerefentry><refentrytitle>systemd.socket</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
@@ -1510,6 +1519,7 @@
                         <citerefentry><refentrytitle>systemd.scope</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
                         <citerefentry><refentrytitle>systemd.slice</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
                         <citerefentry><refentrytitle>systemd.time</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
+                        <citerefentry><refentrytitle>systemd-verify</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
                         <citerefentry project='man-pages'><refentrytitle>capabilities</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
                         <citerefentry><refentrytitle>systemd.directives</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
                         <citerefentry><refentrytitle>uname</refentrytitle><manvolnum>1</manvolnum></citerefentry>

@@ -93,7 +93,7 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0) {
+        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
 
                 switch (c) {
 
@@ -156,7 +156,6 @@ static int parse_argv(int argc, char *argv[]) {
                 default:
                         assert_not_reached("Unhandled option");
                 }
-        }
 
         /* If the first command line argument is only "x" characters
          * we'll write who we are talking to into it, so that "ps" is
@@ -240,7 +239,7 @@ static int rename_service(sd_bus *a, sd_bus *b) {
                   pid, p,
                   uid, name,
                   a->unique_name);
-                ;
+
         return 0;
 }
 
@@ -733,7 +732,7 @@ static int process_driver(sd_bus *a, sd_bus *b, sd_bus_message *m) {
                 if (r < 0)
                         return synthetic_reply_method_errno(m, r, NULL);
 
-                if (service_name_is_valid(arg0) < 0)
+                if (!service_name_is_valid(arg0))
                         return synthetic_reply_method_errno(m, -EINVAL, NULL);
 
                 cmd.flags = KDBUS_NAME_LIST_QUEUED;
@@ -768,7 +767,7 @@ static int process_driver(sd_bus *a, sd_bus *b, sd_bus_message *m) {
                 if (r < 0)
                         return synthetic_reply_method_errno(m, r, NULL);
 
-                if (err > 0)
+                if (err < 0)
                         return synthetic_reply_method_errno(m, err, NULL);
 
                 return synthetic_reply_return_strv(m, owners);
@@ -780,7 +779,7 @@ static int process_driver(sd_bus *a, sd_bus *b, sd_bus_message *m) {
                 if (r < 0)
                         return synthetic_reply_method_errno(m, r, NULL);
 
-                if (service_name_is_valid(name) < 0)
+                if (!service_name_is_valid(name))
                         return synthetic_reply_method_errno(m, -EINVAL, NULL);
 
                 if (streq(name, "org.freedesktop.DBus"))
@@ -799,7 +798,7 @@ static int process_driver(sd_bus *a, sd_bus *b, sd_bus_message *m) {
                 if (r < 0)
                         return synthetic_reply_method_errno(m, r, NULL);
 
-                if (service_name_is_valid(name) < 0)
+                if (!service_name_is_valid(name))
                         return synthetic_reply_method_errno(m, -EINVAL, NULL);
 
                 r = sd_bus_release_name(a, name);
@@ -829,7 +828,7 @@ static int process_driver(sd_bus *a, sd_bus *b, sd_bus_message *m) {
                 if (r < 0)
                         return synthetic_reply_method_errno(m, r, NULL);
 
-                if (service_name_is_valid(name) < 0)
+                if (!service_name_is_valid(name))
                         return synthetic_reply_method_errno(m, -EINVAL, NULL);
                 if ((flags & ~(BUS_NAME_ALLOW_REPLACEMENT|BUS_NAME_REPLACE_EXISTING|BUS_NAME_DO_NOT_QUEUE)) != 0)
                         return synthetic_reply_method_errno(m, -EINVAL, NULL);
@@ -857,7 +856,7 @@ static int process_driver(sd_bus *a, sd_bus *b, sd_bus_message *m) {
                 if (r < 0)
                         return synthetic_reply_method_errno(m, r, NULL);
 
-                if (service_name_is_valid(name) < 0)
+                if (!service_name_is_valid(name))
                         return synthetic_reply_method_errno(m, -EINVAL, NULL);
                 if (flags != 0)
                         return synthetic_reply_method_errno(m, -EINVAL, NULL);
@@ -1091,7 +1090,7 @@ static int patch_sender(sd_bus *a, sd_bus_message *m) {
 
 int main(int argc, char *argv[]) {
 
-        _cleanup_bus_unref_ sd_bus *a = NULL, *b = NULL;
+        _cleanup_bus_close_unref_ sd_bus *a = NULL, *b = NULL;
         sd_id128_t server_id;
         int r, in_fd, out_fd;
         bool got_hello = false;
@@ -1397,7 +1396,7 @@ int main(int argc, char *argv[]) {
                                 else {
                                         k = sd_bus_send(a, m, NULL);
                                         if (k < 0) {
-                                                if (r == -ECONNRESET)
+                                                if (k == -ECONNRESET)
                                                         r = 0;
                                                 else {
                                                         r = k;
@@ -1475,10 +1474,9 @@ int main(int argc, char *argv[]) {
         }
 
 finish:
-        sd_bus_flush(a);
-        sd_bus_flush(b);
-        sd_bus_close(a);
-        sd_bus_close(b);
+        sd_notify(false,
+                  "STOPPING=1\n"
+                  "STATUS=Shutting down.");
 
         policy_free(&policy);
         strv_free(arg_configuration);

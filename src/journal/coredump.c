@@ -26,8 +26,13 @@
 #include <sys/types.h>
 #include <sys/xattr.h>
 
-#include <systemd/sd-journal.h>
-#include <systemd/sd-login.h>
+#ifdef HAVE_ELFUTILS
+#  include <dwarf.h>
+#  include <elfutils/libdwfl.h>
+#endif
+
+#include "systemd/sd-journal.h"
+#include "systemd/sd-login.h"
 
 #include "log.h"
 #include "util.h"
@@ -61,8 +66,8 @@
 #define JOURNAL_SIZE_MAX ((size_t) (767LU*1024LU*1024LU))
 
 /* Make sure to not make this larger than the maximum journal entry
- * size. See ENTRY_SIZE_MAX in journald-native.c. */
-assert_cc(JOURNAL_SIZE_MAX <= ENTRY_SIZE_MAX);
+ * size. See DATA_SIZE_MAX in journald-native.c. */
+assert_cc(JOURNAL_SIZE_MAX <= DATA_SIZE_MAX);
 
 enum {
         INFO_PID,
@@ -114,16 +119,10 @@ static int parse_config(void) {
                 {}
         };
 
-        return config_parse(
-                        NULL,
-                        "/etc/systemd/coredump.conf",
-                        NULL,
-                        "Coredump\0",
-                        config_item_table_lookup,
-                        (void*) items,
-                        false,
-                        false,
-                        NULL);
+        return config_parse(NULL, "/etc/systemd/coredump.conf", NULL,
+                            "Coredump\0",
+                            config_item_table_lookup, items,
+                            false, false, true, NULL);
 }
 
 static int fix_acl(int fd, uid_t uid) {
@@ -597,9 +596,9 @@ int main(int argc, char* argv[]) {
         }
 
         if (sd_pid_get_owner_uid(pid, &owner_uid) >= 0) {
-                asprintf(&core_owner_uid, "COREDUMP_OWNER_UID=" UID_FMT, owner_uid);
-
-                if (core_owner_uid)
+                r = asprintf(&core_owner_uid,
+                             "COREDUMP_OWNER_UID=" UID_FMT, owner_uid);
+                if (r > 0)
                         IOVEC_SET_STRING(iovec[j++], core_owner_uid);
         }
 
@@ -692,6 +691,8 @@ int main(int argc, char* argv[]) {
                 r = coredump_make_stack_trace(coredump_fd, exe, &stacktrace);
                 if (r >= 0)
                         core_message = strjoin("MESSAGE=Process ", info[INFO_PID], " (", comm, ") of user ", info[INFO_UID], " dumped core.\n\n", stacktrace, NULL);
+                else if (r == -EINVAL)
+                        log_warning("Failed to generate stack trace: %s", dwfl_errmsg(dwfl_errno()));
                 else
                         log_warning("Failed to generate stack trace: %s", strerror(-r));
         }

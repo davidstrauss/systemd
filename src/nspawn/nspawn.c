@@ -40,7 +40,6 @@
 #include <sys/un.h>
 #include <sys/socket.h>
 #include <linux/netlink.h>
-#include <sys/eventfd.h>
 #include <net/if.h>
 #include <linux/veth.h>
 #include <sys/personality.h>
@@ -84,12 +83,12 @@
 #include "def.h"
 #include "rtnl-util.h"
 #include "udev-util.h"
-#include "eventfd-util.h"
 #include "blkid-util.h"
 #include "gpt.h"
 #include "siphash24.h"
 #include "copy.h"
 #include "base-filesystem.h"
+#include "barrier.h"
 
 #ifdef HAVE_SECCOMP
 #include "seccomp-util.h"
@@ -167,8 +166,7 @@ static unsigned long arg_personality = 0xffffffffLU;
 static const char *arg_image = NULL;
 static Volatile arg_volatile = VOLATILE_NO;
 
-static int help(void) {
-
+static void help(void) {
         printf("%s [OPTIONS...] [PATH] [ARGUMENTS...]\n\n"
                "Spawn a minimal namespace container for debugging, testing and building.\n\n"
                "  -h --help                 Show this help\n"
@@ -217,8 +215,6 @@ static int help(void) {
                "                            the service unit nspawn is running in\n"
                "     --volatile[=MODE]      Run the system in volatile mode\n",
                program_invocation_short_name);
-
-        return 0;
 }
 
 static int parse_argv(int argc, char *argv[]) {
@@ -286,12 +282,13 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "+hD:u:bL:M:jS:Z:qi:", options, NULL)) >= 0) {
+        while ((c = getopt_long(argc, argv, "+hD:u:bL:M:jS:Z:qi:", options, NULL)) >= 0)
 
                 switch (c) {
 
                 case 'h':
-                        return help();
+                        help();
+                        return 0;
 
                 case ARG_VERSION:
                         puts(PACKAGE_STRING);
@@ -396,7 +393,7 @@ static int parse_argv(int argc, char *argv[]) {
 
                 case ARG_CAPABILITY:
                 case ARG_DROP_CAPABILITY: {
-                        char *state, *word;
+                        const char *state, *word;
                         size_t length;
 
                         FOREACH_WORD_SEPARATOR(word, length, optarg, ",", state) {
@@ -594,7 +591,6 @@ static int parse_argv(int argc, char *argv[]) {
                 default:
                         assert_not_reached("Unhandled option");
                 }
-        }
 
         if (arg_share_system)
                 arg_register = false;
@@ -1390,7 +1386,7 @@ static int drop_capabilities(void) {
 
 static int register_machine(pid_t pid, int local_ifindex) {
         _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
-        _cleanup_bus_unref_ sd_bus *bus = NULL;
+        _cleanup_bus_close_unref_ sd_bus *bus = NULL;
         int r;
 
         if (!arg_register)
@@ -1525,7 +1521,7 @@ static int register_machine(pid_t pid, int local_ifindex) {
 static int terminate_machine(pid_t pid) {
         _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_bus_message_unref_ sd_bus_message *reply = NULL;
-        _cleanup_bus_unref_ sd_bus *bus = NULL;
+        _cleanup_bus_close_unref_ sd_bus *bus = NULL;
         const char *path;
         int r;
 
@@ -1610,9 +1606,10 @@ static int reset_audit_loginuid(void) {
         return 0;
 }
 
-#define HASH_KEY SD_ID128_MAKE(c3,c4,f9,19,b5,57,b2,1c,e6,cf,14,27,03,9c,ee,a2)
+#define HOST_HASH_KEY SD_ID128_MAKE(1a,37,6f,c7,46,ec,45,0b,ad,a3,d5,31,06,60,5d,b1)
+#define CONTAINER_HASH_KEY SD_ID128_MAKE(c3,c4,f9,19,b5,57,b2,1c,e6,cf,14,27,03,9c,ee,a2)
 
-static int get_mac(struct ether_addr *mac) {
+static int generate_mac(struct ether_addr *mac, sd_id128_t hash_key) {
         int r;
 
         uint8_t result[8];
@@ -1634,7 +1631,7 @@ static int get_mac(struct ether_addr *mac) {
 
         /* Let's hash the host machine ID plus the container name. We
          * use a fixed, but originally randomly created hash key here. */
-        siphash24(result, v, sz, HASH_KEY.bytes);
+        siphash24(result, v, sz, hash_key.bytes);
 
         assert_cc(ETH_ALEN <= sizeof(result));
         memcpy(mac->ether_addr_octet, result, ETH_ALEN);
@@ -1649,7 +1646,7 @@ static int get_mac(struct ether_addr *mac) {
 static int setup_veth(pid_t pid, char iface_name[IFNAMSIZ], int *ifi) {
         _cleanup_rtnl_message_unref_ sd_rtnl_message *m = NULL;
         _cleanup_rtnl_unref_ sd_rtnl *rtnl = NULL;
-        struct ether_addr mac;
+        struct ether_addr mac_host, mac_container;
         int r, i;
 
         if (!arg_private_network)
@@ -1660,15 +1657,18 @@ static int setup_veth(pid_t pid, char iface_name[IFNAMSIZ], int *ifi) {
 
         /* Use two different interface name prefixes depending whether
          * we are in bridge mode or not. */
-        if (arg_network_bridge)
-                memcpy(iface_name, "vb-", 3);
-        else
-                memcpy(iface_name, "ve-", 3);
-        strncpy(iface_name+3, arg_machine, IFNAMSIZ - 3);
+        snprintf(iface_name, IFNAMSIZ, "%s-%s",
+                 arg_network_bridge ? "vb" : "ve", arg_machine);
 
-        r = get_mac(&mac);
+        r = generate_mac(&mac_container, CONTAINER_HASH_KEY);
         if (r < 0) {
-                log_error("Failed to generate predictable MAC address for host0");
+                log_error("Failed to generate predictable MAC address for container side");
+                return r;
+        }
+
+        r = generate_mac(&mac_host, HOST_HASH_KEY);
+        if (r < 0) {
+                log_error("Failed to generate predictable MAC address for host side");
                 return r;
         }
 
@@ -1687,6 +1687,12 @@ static int setup_veth(pid_t pid, char iface_name[IFNAMSIZ], int *ifi) {
         r = sd_rtnl_message_append_string(m, IFLA_IFNAME, iface_name);
         if (r < 0) {
                 log_error("Failed to add netlink interface name: %s", strerror(-r));
+                return r;
+        }
+
+        r = sd_rtnl_message_append_ether_addr(m, IFLA_ADDRESS, &mac_host);
+        if (r < 0) {
+                log_error("Failed to add netlink MAC address: %s", strerror(-r));
                 return r;
         }
 
@@ -1714,7 +1720,7 @@ static int setup_veth(pid_t pid, char iface_name[IFNAMSIZ], int *ifi) {
                 return r;
         }
 
-        r = sd_rtnl_message_append_ether_addr(m, IFLA_ADDRESS, &mac);
+        r = sd_rtnl_message_append_ether_addr(m, IFLA_ADDRESS, &mac_container);
         if (r < 0) {
                 log_error("Failed to add netlink MAC address: %s", strerror(-r));
                 return r;
@@ -1880,7 +1886,7 @@ static int move_network_interfaces(pid_t pid) {
                 if (ifi < 0)
                         return ifi;
 
-                r = sd_rtnl_message_new_link(rtnl, &m, RTM_NEWLINK, ifi);
+                r = sd_rtnl_message_new_link(rtnl, &m, RTM_SETLINK, ifi);
                 if (r < 0) {
                         log_error("Failed to allocate netlink message: %s", strerror(-r));
                         return r;
@@ -2603,7 +2609,8 @@ static int spawn_getent(const char *database, const char *key, pid_t *rpid) {
 }
 
 static int change_uid_gid(char **_home) {
-        char line[LINE_MAX], *w, *x, *state, *u, *g, *h;
+        char line[LINE_MAX], *x, *u, *g, *h;
+        const char *word, *state;
         _cleanup_free_ uid_t *uids = NULL;
         _cleanup_free_ char *home = NULL;
         _cleanup_fclose_ FILE *f = NULL;
@@ -2753,10 +2760,10 @@ static int change_uid_gid(char **_home) {
         x += strcspn(x, WHITESPACE);
         x += strspn(x, WHITESPACE);
 
-        FOREACH_WORD(w, l, x, state) {
+        FOREACH_WORD(word, l, x, state) {
                 char c[l+1];
 
-                memcpy(c, w, l);
+                memcpy(c, word, l);
                 c[l] = 0;
 
                 if (!GREEDY_REALLOC(uids, sz, n_uids+1))
@@ -3064,7 +3071,9 @@ int main(int argc, char *argv[]) {
                 goto finish;
         }
 
-        sd_notify(0, "READY=1");
+        sd_notify(false,
+                  "READY=1\n"
+                  "STATUS=Container running.");
 
         assert_se(sigemptyset(&mask) == 0);
         assert_se(sigemptyset(&mask_chld) == 0);
@@ -3074,11 +3083,17 @@ int main(int argc, char *argv[]) {
 
         for (;;) {
                 ContainerStatus container_status;
-                int eventfds[2] = { -1, -1 };
+                _cleanup_(barrier_destroy) Barrier barrier = BARRIER_NULL;
                 struct sigaction sa = {
                         .sa_handler = nop_handler,
                         .sa_flags = SA_NOCLDSTOP,
                 };
+
+                r = barrier_create(&barrier);
+                if (r < 0) {
+                        log_error("Cannot initialize IPC barrier: %s", strerror(-r));
+                        goto finish;
+                }
 
                 /* Child can be killed before execv(), so handle SIGCHLD
                  * in order to interrupt parent's blocking calls and
@@ -3095,9 +3110,9 @@ int main(int argc, char *argv[]) {
                         goto finish;
                 }
 
-                pid = clone_with_eventfd(SIGCHLD|CLONE_NEWNS|
-                                         (arg_share_system ? 0 : CLONE_NEWIPC|CLONE_NEWPID|CLONE_NEWUTS)|
-                                         (arg_private_network ? CLONE_NEWNET : 0), eventfds);
+                pid = syscall(__NR_clone, SIGCHLD|CLONE_NEWNS|
+                                          (arg_share_system ? 0 : CLONE_NEWIPC|CLONE_NEWPID|CLONE_NEWUTS)|
+                                          (arg_private_network ? CLONE_NEWNET : 0), NULL);
                 if (pid < 0) {
                         if (errno == EINVAL)
                                 log_error("clone() failed, do you have namespace support enabled in your kernel? (You need UTS, IPC, PID and NET namespacing built in): %m");
@@ -3126,6 +3141,8 @@ int main(int argc, char *argv[]) {
                         };
                         char **env_use;
 
+                        barrier_set_role(&barrier, BARRIER_CHILD);
+
                         envp[n_env] = strv_find_prefix(environ, "TERM=");
                         if (envp[n_env])
                                 n_env ++;
@@ -3139,9 +3156,7 @@ int main(int argc, char *argv[]) {
                         kmsg_socket_pair[0] = safe_close(kmsg_socket_pair[0]);
 
                         reset_all_signal_handlers();
-
-                        assert_se(sigemptyset(&mask) == 0);
-                        assert_se(sigprocmask(SIG_SETMASK, &mask, NULL) == 0);
+                        reset_signal_mask();
 
                         k = open_terminal(console, O_RDWR);
                         if (k != STDIN_FILENO) {
@@ -3151,26 +3166,26 @@ int main(int argc, char *argv[]) {
                                 }
 
                                 log_error("Failed to open console: %s", strerror(-k));
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
                         }
 
                         if (dup2(STDIN_FILENO, STDOUT_FILENO) != STDOUT_FILENO ||
                             dup2(STDIN_FILENO, STDERR_FILENO) != STDERR_FILENO) {
                                 log_error("Failed to duplicate console: %m");
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
                         }
 
                         if (setsid() < 0) {
                                 log_error("setsid() failed: %m");
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
                         }
 
                         if (reset_audit_loginuid() < 0)
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
 
                         if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0) {
                                 log_error("PR_SET_PDEATHSIG failed: %m");
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
                         }
 
                         /* Mark everything as slave, so that we still
@@ -3178,113 +3193,109 @@ int main(int argc, char *argv[]) {
                          * propagate mounts to the real root. */
                         if (mount(NULL, "/", NULL, MS_SLAVE|MS_REC, NULL) < 0) {
                                 log_error("MS_SLAVE|MS_REC failed: %m");
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
                         }
 
                         if (mount_devices(arg_directory,
                                           root_device, root_device_rw,
                                           home_device, home_device_rw,
                                           srv_device, srv_device_rw) < 0)
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
 
                         /* Turn directory into bind mount */
                         if (mount(arg_directory, arg_directory, "bind", MS_BIND|MS_REC, NULL) < 0) {
                                 log_error("Failed to make bind mount: %m");
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
                         }
 
                         r = setup_volatile(arg_directory);
                         if (r < 0)
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
 
                         if (setup_volatile_state(arg_directory) < 0)
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
 
                         r = base_filesystem_create(arg_directory);
                         if (r < 0)
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
 
                         if (arg_read_only) {
                                 k = bind_remount_recursive(arg_directory, true);
                                 if (k < 0) {
                                         log_error("Failed to make tree read-only: %s", strerror(-k));
-                                        goto child_fail;
+                                        _exit(EXIT_FAILURE);
                                 }
                         }
 
                         if (mount_all(arg_directory) < 0)
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
 
                         if (copy_devnodes(arg_directory) < 0)
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
 
                         if (setup_ptmx(arg_directory) < 0)
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
 
                         dev_setup(arg_directory);
 
                         if (setup_seccomp() < 0)
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
 
                         if (setup_dev_console(arg_directory, console) < 0)
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
 
                         if (setup_kmsg(arg_directory, kmsg_socket_pair[1]) < 0)
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
 
                         kmsg_socket_pair[1] = safe_close(kmsg_socket_pair[1]);
 
                         if (setup_boot_id(arg_directory) < 0)
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
 
                         if (setup_timezone(arg_directory) < 0)
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
 
                         if (setup_resolv_conf(arg_directory) < 0)
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
 
                         if (setup_journal(arg_directory) < 0)
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
 
                         if (mount_binds(arg_directory, arg_bind, false) < 0)
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
 
                         if (mount_binds(arg_directory, arg_bind_ro, true) < 0)
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
 
                         if (mount_tmpfs(arg_directory) < 0)
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
 
                         if (setup_kdbus(arg_directory, kdbus_domain) < 0)
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
 
                         /* Tell the parent that we are ready, and that
                          * it can cgroupify us to that we lack access
                          * to certain devices and resources. */
-                        r = eventfd_send_state(eventfds[1],
-                                               EVENTFD_CHILD_SUCCEEDED);
-                        eventfds[1] = safe_close(eventfds[1]);
-                        if (r < 0)
-                                goto child_fail;
+                        barrier_place(&barrier);
 
                         if (chdir(arg_directory) < 0) {
                                 log_error("chdir(%s) failed: %m", arg_directory);
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
                         }
 
                         if (mount(arg_directory, "/", NULL, MS_MOVE, NULL) < 0) {
                                 log_error("mount(MS_MOVE) failed: %m");
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
                         }
 
                         if (chroot(".") < 0) {
                                 log_error("chroot() failed: %m");
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
                         }
 
                         if (chdir("/") < 0) {
                                 log_error("chdir() failed: %m");
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
                         }
 
                         umask(0022);
@@ -3294,18 +3305,18 @@ int main(int argc, char *argv[]) {
 
                         if (drop_capabilities() < 0) {
                                 log_error("drop_capabilities() failed: %m");
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
                         }
 
                         r = change_uid_gid(&home);
                         if (r < 0)
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
 
                         if ((asprintf((char**)(envp + n_env++), "HOME=%s", home ? home: "/root") < 0) ||
                             (asprintf((char**)(envp + n_env++), "USER=%s", arg_user ? arg_user : "root") < 0) ||
                             (asprintf((char**)(envp + n_env++), "LOGNAME=%s", arg_user ? arg_user : "root") < 0)) {
                                 log_oom();
-                                goto child_fail;
+                                _exit(EXIT_FAILURE);
                         }
 
                         if (!sd_id128_equal(arg_uuid, SD_ID128_NULL)) {
@@ -3313,7 +3324,7 @@ int main(int argc, char *argv[]) {
 
                                 if (asprintf((char**)(envp + n_env++), "container_uuid=%s", id128_format_as_uuid(arg_uuid, as_uuid)) < 0) {
                                         log_oom();
-                                        goto child_fail;
+                                        _exit(EXIT_FAILURE);
                                 }
                         }
 
@@ -3321,13 +3332,13 @@ int main(int argc, char *argv[]) {
                                 k = fdset_cloexec(fds, false);
                                 if (k < 0) {
                                         log_error("Failed to unset O_CLOEXEC for file descriptors.");
-                                        goto child_fail;
+                                        _exit(EXIT_FAILURE);
                                 }
 
                                 if ((asprintf((char **)(envp + n_env++), "LISTEN_FDS=%u", n_fd_passed) < 0) ||
                                     (asprintf((char **)(envp + n_env++), "LISTEN_PID=1") < 0)) {
                                         log_oom();
-                                        goto child_fail;
+                                        _exit(EXIT_FAILURE);
                                 }
                         }
 
@@ -3336,12 +3347,12 @@ int main(int argc, char *argv[]) {
                         if (arg_personality != 0xffffffffLU) {
                                 if (personality(arg_personality) < 0) {
                                         log_error("personality() failed: %m");
-                                        goto child_fail;
+                                        _exit(EXIT_FAILURE);
                                 }
                         } else if (secondary) {
                                 if (personality(PER_LINUX32) < 0) {
                                         log_error("personality() failed: %m");
-                                        goto child_fail;
+                                        _exit(EXIT_FAILURE);
                                 }
                         }
 
@@ -3349,7 +3360,7 @@ int main(int argc, char *argv[]) {
                         if (arg_selinux_context)
                                 if (setexeccon((security_context_t) arg_selinux_context) < 0) {
                                         log_error("setexeccon(\"%s\") failed: %m", arg_selinux_context);
-                                        goto child_fail;
+                                        _exit(EXIT_FAILURE);
                                 }
 #endif
 
@@ -3359,7 +3370,7 @@ int main(int argc, char *argv[]) {
                                 n = strv_env_merge(2, envp, arg_setenv);
                                 if (!n) {
                                         log_oom();
-                                        goto child_fail;
+                                        _exit(EXIT_FAILURE);
                                 }
 
                                 env_use = n;
@@ -3367,10 +3378,8 @@ int main(int argc, char *argv[]) {
                                 env_use = (char**) envp;
 
                         /* Wait until the parent is ready with the setup, too... */
-                        r = eventfd_parent_succeeded(eventfds[0]);
-                        eventfds[0] = safe_close(eventfds[0]);
-                        if (r < 0)
-                                goto child_fail;
+                        if (!barrier_place_and_sync(&barrier))
+                                _exit(EXIT_FAILURE);
 
                         if (arg_boot) {
                                 char **a;
@@ -3399,29 +3408,15 @@ int main(int argc, char *argv[]) {
                         }
 
                         log_error("execv() failed: %m");
-
-                child_fail:
-                        /* Tell the parent that the setup failed, so he
-                         * can clean up resources and terminate. */
-                        if (eventfds[1] != -1)
-                                eventfd_send_state(eventfds[1],
-                                                   EVENTFD_CHILD_FAILED);
                         _exit(EXIT_FAILURE);
                 }
 
+                barrier_set_role(&barrier, BARRIER_PARENT);
                 fdset_free(fds);
                 fds = NULL;
 
-                /* Wait for the child event:
-                 * If EVENTFD_CHILD_FAILED, the child will terminate soon.
-                 * If EVENTFD_CHILD_SUCCEEDED, the child is reporting that
-                 * it is ready with all it needs to do with priviliges.
-                 * After we got the notification we can make the process
-                 * join its cgroup which might limit what it can do */
-                r = eventfd_child_succeeded(eventfds[1]);
-                eventfds[1] = safe_close(eventfds[1]);
-
-                if (r >= 0) {
+                /* wait for child-setup to be done */
+                if (barrier_place_and_sync(&barrier)) {
                         int ifi = 0;
 
                         r = move_network_interfaces(pid);
@@ -3458,10 +3453,7 @@ int main(int argc, char *argv[]) {
                         /* Notify the child that the parent is ready with all
                          * its setup, and that the child can now hand over
                          * control to the code to run inside the container. */
-                        r = eventfd_send_state(eventfds[0], EVENTFD_PARENT_SUCCEEDED);
-                        eventfds[0] = safe_close(eventfds[0]);
-                        if (r < 0)
-                                goto finish;
+                        barrier_place(&barrier);
 
                         k = process_pty(master, &mask, arg_boot ? pid : 0, SIGRTMIN+3);
                         if (k < 0) {
@@ -3512,6 +3504,10 @@ int main(int argc, char *argv[]) {
         }
 
 finish:
+        sd_notify(false,
+                  "STOPPING=1\n"
+                  "STATUS=Terminating...");
+
         loop_remove(loop_nr, &image_fd);
 
         if (pid > 0)

@@ -48,6 +48,7 @@
 
 #include "udev.h"
 #include "udev-util.h"
+#include "rtnl-util.h"
 #include "sd-daemon.h"
 #include "cgroup-util.h"
 #include "dev-setup.h"
@@ -57,8 +58,7 @@ static bool debug;
 
 void udev_main_log(struct udev *udev, int priority,
                    const char *file, int line, const char *fn,
-                   const char *format, va_list args)
-{
+                   const char *format, va_list args) {
         log_metav(priority, file, line, fn, format, args);
 }
 
@@ -74,6 +74,8 @@ static bool reload;
 static int children;
 static int children_max;
 static int exec_delay;
+static usec_t event_timeout_usec = 180 * USEC_PER_SEC;
+static usec_t event_timeout_warn_usec = 180 * USEC_PER_SEC / 3;
 static sigset_t sigmask_orig;
 static UDEV_LIST(event_list);
 static UDEV_LIST(worker_list);
@@ -100,13 +102,9 @@ struct event {
         dev_t devnum;
         int ifindex;
         bool is_block;
-#ifdef HAVE_FIRMWARE
-        bool nodelay;
-#endif
 };
 
-static inline struct event *node_to_event(struct udev_list_node *node)
-{
+static inline struct event *node_to_event(struct udev_list_node *node) {
         return container_of(node, struct event, node);
 }
 
@@ -128,6 +126,7 @@ struct worker {
         enum worker_state state;
         struct event *event;
         usec_t event_start_usec;
+        bool event_warned;
 };
 
 /* passed from worker to main process */
@@ -136,34 +135,29 @@ struct worker_message {
         int exitcode;
 };
 
-static inline struct worker *node_to_worker(struct udev_list_node *node)
-{
+static inline struct worker *node_to_worker(struct udev_list_node *node) {
         return container_of(node, struct worker, node);
 }
 
-static void event_queue_delete(struct event *event)
-{
+static void event_queue_delete(struct event *event) {
         udev_list_node_remove(&event->node);
         udev_device_unref(event->dev);
         free(event);
 }
 
-static struct worker *worker_ref(struct worker *worker)
-{
+static struct worker *worker_ref(struct worker *worker) {
         worker->refcount++;
         return worker;
 }
 
-static void worker_cleanup(struct worker *worker)
-{
+static void worker_cleanup(struct worker *worker) {
         udev_list_node_remove(&worker->node);
         udev_monitor_unref(worker->monitor);
         children--;
         free(worker);
 }
 
-static void worker_unref(struct worker *worker)
-{
+static void worker_unref(struct worker *worker) {
         worker->refcount--;
         if (worker->refcount > 0)
                 return;
@@ -171,8 +165,7 @@ static void worker_unref(struct worker *worker)
         worker_cleanup(worker);
 }
 
-static void worker_list_cleanup(struct udev *udev)
-{
+static void worker_list_cleanup(struct udev *udev) {
         struct udev_list_node *loop, *tmp;
 
         udev_list_node_foreach_safe(loop, tmp, &worker_list) {
@@ -182,8 +175,7 @@ static void worker_list_cleanup(struct udev *udev)
         }
 }
 
-static void worker_new(struct event *event)
-{
+static void worker_new(struct event *event) {
         struct udev *udev = event->udev;
         struct worker *worker;
         struct udev_monitor *worker_monitor;
@@ -211,6 +203,7 @@ static void worker_new(struct event *event)
         case 0: {
                 struct udev_device *dev = NULL;
                 int fd_monitor;
+                _cleanup_rtnl_unref_ sd_rtnl *rtnl = NULL;
                 struct epoll_event ep_signal, ep_monitor;
                 sigset_t mask;
                 int rc = EXIT_SUCCESS;
@@ -285,26 +278,17 @@ static void worker_new(struct event *event)
                                 udev_event->exec_delay = exec_delay;
 
                         /*
-                         * Take a "read lock" on the device node; this establishes
+                         * Take a shared lock on the device node; this establishes
                          * a concept of device "ownership" to serialize device
-                         * access. External processes holding a "write lock" will
+                         * access. External processes holding an exclusive lock will
                          * cause udev to skip the event handling; in the case udev
-                         * acquired the lock, the external process will block until
+                         * acquired the lock, the external process can block until
                          * udev has finished its event handling.
                          */
-
-                        /*
-                         * <kabi_> since we make check - device seems unused - we try
-                         *         ioctl to deactivate - and device is found to be opened
-                         * <kay> sure, you try to take a write lock
-                         * <kay> if you get it udev is out
-                         * <kay> if you can't get it, udev is busy
-                         * <kabi_> we cannot deactivate openned device  (as it is in-use)
-                         * <kay> maybe we should just exclude dm from that thing entirely
-                         * <kabi_> IMHO this sounds like a good plan for this moment
-                         */
-                        if (streq_ptr("block", udev_device_get_subsystem(dev)) &&
-                            !startswith(udev_device_get_sysname(dev), "dm-")) {
+                        if (!streq_ptr(udev_device_get_action(dev), "remove") &&
+                            streq_ptr("block", udev_device_get_subsystem(dev)) &&
+                            !startswith(udev_device_get_sysname(dev), "dm-") &&
+                            !startswith(udev_device_get_sysname(dev), "md")) {
                                 struct udev_device *d = dev;
 
                                 if (streq_ptr("partition", udev_device_get_devtype(d)))
@@ -321,10 +305,16 @@ static void worker_new(struct event *event)
                                 }
                         }
 
-                        /* apply rules, create node, symlinks */
-                        udev_event_execute_rules(udev_event, rules, &sigmask_orig);
+                        /* needed for renaming netifs */
+                        udev_event->rtnl = rtnl;
 
-                        udev_event_execute_run(udev_event, &sigmask_orig);
+                        /* apply rules, create node, symlinks */
+                        udev_event_execute_rules(udev_event, event_timeout_usec, event_timeout_warn_usec, rules, &sigmask_orig);
+
+                        udev_event_execute_run(udev_event, event_timeout_usec, event_timeout_warn_usec, &sigmask_orig);
+
+                        /* in case rtnl was initialized */
+                        rtnl = sd_rtnl_ref(udev_event->rtnl);
 
                         /* apply/restore inotify watch */
                         if (udev_event->inotify_watch) {
@@ -415,6 +405,7 @@ out:
                 worker->pid = pid;
                 worker->state = WORKER_RUNNING;
                 worker->event_start_usec = now(CLOCK_MONOTONIC);
+                worker->event_warned = false;
                 worker->event = event;
                 event->state = EVENT_RUNNING;
                 udev_list_node_append(&worker->node, &worker_list);
@@ -424,8 +415,7 @@ out:
         }
 }
 
-static void event_run(struct event *event)
-{
+static void event_run(struct event *event) {
         struct udev_list_node *loop;
 
         udev_list_node_foreach(loop, &worker_list) {
@@ -446,6 +436,7 @@ static void event_run(struct event *event)
                 worker->event = event;
                 worker->state = WORKER_RUNNING;
                 worker->event_start_usec = now(CLOCK_MONOTONIC);
+                worker->event_warned = false;
                 event->state = EVENT_RUNNING;
                 return;
         }
@@ -460,8 +451,7 @@ static void event_run(struct event *event)
         worker_new(event);
 }
 
-static int event_queue_insert(struct udev_device *dev)
-{
+static int event_queue_insert(struct udev_device *dev) {
         struct event *event;
 
         event = new0(struct event, 1);
@@ -477,10 +467,6 @@ static int event_queue_insert(struct udev_device *dev)
         event->devnum = udev_device_get_devnum(dev);
         event->is_block = streq("block", udev_device_get_subsystem(dev));
         event->ifindex = udev_device_get_ifindex(dev);
-#ifdef HAVE_FIRMWARE
-        if (streq(udev_device_get_subsystem(dev), "firmware"))
-                event->nodelay = true;
-#endif
 
         log_debug("seq %llu queued, '%s' '%s'", udev_device_get_seqnum(dev),
              udev_device_get_action(dev), udev_device_get_subsystem(dev));
@@ -490,8 +476,7 @@ static int event_queue_insert(struct udev_device *dev)
         return 0;
 }
 
-static void worker_kill(struct udev *udev)
-{
+static void worker_kill(struct udev *udev) {
         struct udev_list_node *loop;
 
         udev_list_node_foreach(loop, &worker_list) {
@@ -506,8 +491,7 @@ static void worker_kill(struct udev *udev)
 }
 
 /* lookup event for identical, parent, child device */
-static bool is_devpath_busy(struct event *event)
-{
+static bool is_devpath_busy(struct event *event) {
         struct udev_list_node *loop;
         size_t common;
 
@@ -559,12 +543,6 @@ static bool is_devpath_busy(struct event *event)
                         return true;
                 }
 
-#ifdef HAVE_FIRMWARE
-                /* allow to bypass the dependency tracking */
-                if (event->nodelay)
-                        continue;
-#endif
-
                 /* parent device event found */
                 if (event->devpath[common] == '/') {
                         event->delaying_seqnum = loop_event->seqnum;
@@ -584,8 +562,7 @@ static bool is_devpath_busy(struct event *event)
         return false;
 }
 
-static void event_queue_start(struct udev *udev)
-{
+static void event_queue_start(struct udev *udev) {
         struct udev_list_node *loop;
 
         udev_list_node_foreach(loop, &event_list) {
@@ -602,8 +579,7 @@ static void event_queue_start(struct udev *udev)
         }
 }
 
-static void event_queue_cleanup(struct udev *udev, enum event_state match_type)
-{
+static void event_queue_cleanup(struct udev *udev, enum event_state match_type) {
         struct udev_list_node *loop, *tmp;
 
         udev_list_node_foreach_safe(loop, tmp, &event_list) {
@@ -616,8 +592,7 @@ static void event_queue_cleanup(struct udev *udev, enum event_state match_type)
         }
 }
 
-static void worker_returned(int fd_worker)
-{
+static void worker_returned(int fd_worker) {
         for (;;) {
                 struct worker_message msg;
                 ssize_t size;
@@ -649,8 +624,7 @@ static void worker_returned(int fd_worker)
 }
 
 /* receive the udevd message from userspace */
-static struct udev_ctrl_connection *handle_ctrl_msg(struct udev_ctrl *uctrl)
-{
+static struct udev_ctrl_connection *handle_ctrl_msg(struct udev_ctrl *uctrl) {
         struct udev *udev = udev_ctrl_get_udev(uctrl);
         struct udev_ctrl_connection *ctrl_conn;
         struct udev_ctrl_msg *ctrl_msg = NULL;
@@ -839,8 +813,7 @@ static int synthesize_change(struct udev_device *dev) {
         return 0;
 }
 
-static int handle_inotify(struct udev *udev)
-{
+static int handle_inotify(struct udev *udev) {
         int nbytes, pos;
         char *buf;
         struct inotify_event *ev;
@@ -879,8 +852,7 @@ static int handle_inotify(struct udev *udev)
         return 0;
 }
 
-static void handle_signal(struct udev *udev, int signo)
-{
+static void handle_signal(struct udev *udev, int signo) {
         switch (signo) {
         case SIGINT:
         case SIGTERM:
@@ -940,8 +912,7 @@ static void handle_signal(struct udev *udev, int signo)
         }
 }
 
-static int systemd_fds(struct udev *udev, int *rctrl, int *rnetlink)
-{
+static int systemd_fds(struct udev *udev, int *rctrl, int *rnetlink) {
         int ctrl = -1, netlink = -1;
         int fd, n;
 
@@ -982,10 +953,9 @@ static int systemd_fds(struct udev *udev, int *rctrl, int *rnetlink)
  *   udev.children-max=<number of workers>  events are fully serialized if set to 1
  *   udev.exec-delay=<number of seconds>    delay execution of every executed program
  */
-static void kernel_cmdline_options(struct udev *udev)
-{
+static void kernel_cmdline_options(struct udev *udev) {
         _cleanup_free_ char *line = NULL;
-        char *w, *state;
+        const char *word, *state;
         size_t l;
         int r;
 
@@ -995,10 +965,10 @@ static void kernel_cmdline_options(struct udev *udev)
         if (r <= 0)
                 return;
 
-        FOREACH_WORD_QUOTED(w, l, line, state) {
+        FOREACH_WORD_QUOTED(word, l, line, state) {
                 char *s, *opt;
 
-                s = strndup(w, l);
+                s = strndup(word, l);
                 if (!s)
                         break;
 
@@ -1018,14 +988,16 @@ static void kernel_cmdline_options(struct udev *udev)
                         children_max = strtoul(opt + 18, NULL, 0);
                 } else if (startswith(opt, "udev.exec-delay=")) {
                         exec_delay = strtoul(opt + 16, NULL, 0);
+                } else if (startswith(opt, "udev.event-timeout=")) {
+                        event_timeout_usec = strtoul(opt + 16, NULL, 0) * USEC_PER_SEC;
+                        event_timeout_warn_usec = (event_timeout_usec / 3) ? : 1;
                 }
 
                 free(s);
         }
 }
 
-int main(int argc, char *argv[])
-{
+int main(int argc, char *argv[]) {
         struct udev *udev;
         sigset_t mask;
         int daemonize = false;
@@ -1035,6 +1007,7 @@ int main(int argc, char *argv[])
                 { "debug", no_argument, NULL, 'D' },
                 { "children-max", required_argument, NULL, 'c' },
                 { "exec-delay", required_argument, NULL, 'e' },
+                { "event-timeout", required_argument, NULL, 't' },
                 { "resolve-names", required_argument, NULL, 'N' },
                 { "help", no_argument, NULL, 'h' },
                 { "version", no_argument, NULL, 'V' },
@@ -1078,6 +1051,10 @@ int main(int argc, char *argv[])
                 case 'e':
                         exec_delay = strtoul(optarg, NULL, 0);
                         break;
+                case 't':
+                        event_timeout_usec = strtoul(optarg, NULL, 0) * USEC_PER_SEC;
+                        event_timeout_warn_usec = (event_timeout_usec / 3) ? : 1;
+                        break;
                 case 'D':
                         debug = true;
                         log_set_max_level(LOG_DEBUG);
@@ -1102,6 +1079,7 @@ int main(int argc, char *argv[])
                                "  --debug\n"
                                "  --children-max=<maximum number of workers>\n"
                                "  --exec-delay=<seconds to wait before executing RUN=>\n"
+                               "  --event-timeout=<seconds to wait before terminating an event>\n"
                                "  --resolve-names=early|late|never\n"
                                "  --version\n"
                                "  --help\n"
@@ -1228,7 +1206,7 @@ int main(int argc, char *argv[])
                 sd_notify(1, "READY=1");
         }
 
-        print_kmsg("starting version " VERSION "\n");
+        log_info("starting version " VERSION "\n");
 
         if (!debug) {
                 int fd;
@@ -1411,23 +1389,28 @@ int main(int argc, char *argv[])
                         /* check for hanging events */
                         udev_list_node_foreach(loop, &worker_list) {
                                 struct worker *worker = node_to_worker(loop);
+                                usec_t ts;
 
                                 if (worker->state != WORKER_RUNNING)
                                         continue;
 
-                                if ((now(CLOCK_MONOTONIC) - worker->event_start_usec) > 30 * USEC_PER_SEC) {
-                                        log_error("worker [%u] %s timeout; kill it", worker->pid,
-                                            worker->event ? worker->event->devpath : "<idle>");
-                                        kill(worker->pid, SIGKILL);
-                                        worker->state = WORKER_KILLED;
+                                ts = now(CLOCK_MONOTONIC);
 
-                                        /* drop reference taken for state 'running' */
-                                        worker_unref(worker);
-                                        if (worker->event) {
+                                if ((ts - worker->event_start_usec) > event_timeout_warn_usec) {
+                                        if ((ts - worker->event_start_usec) > event_timeout_usec) {
+                                                log_error("worker [%u] %s timeout; kill it", worker->pid, worker->event->devpath);
+                                                kill(worker->pid, SIGKILL);
+                                                worker->state = WORKER_KILLED;
+
+                                                /* drop reference taken for state 'running' */
+                                                worker_unref(worker);
                                                 log_error("seq %llu '%s' killed", udev_device_get_seqnum(worker->event->dev), worker->event->devpath);
                                                 worker->event->exitcode = -64;
                                                 event_queue_delete(worker->event);
                                                 worker->event = NULL;
+                                        } else if (!worker->event_warned) {
+                                                log_warning("worker [%u] %s is taking a long time", worker->pid, worker->event->devpath);
+                                                worker->event_warned = true;
                                         }
                                 }
                         }

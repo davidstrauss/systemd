@@ -101,7 +101,7 @@
                 allows <command>systemd-firstboot</command> to operate
                 on mounted but not booted disk images and in early
                 boot. It is not recommended to use
-                <command>systemd-firsboot</command> on the running
+                <command>systemd-firstboot</command> on the running
                 system while it is up.</para>
         </refsect1>
 
@@ -213,7 +213,7 @@
                                 <para>Query the user for locale,
                                 timezone, hostname and root
                                 password. This is equivalent to
-                                specifiying
+                                specifying
                                 <option>--prompt-locale</option>,
                                 <option>--prompt-timezone</option>,
                                 <option>--prompt-hostname</option>,
@@ -238,7 +238,7 @@
 
                                 <para>Copy locale, time zone and root
                                 password from the host. This is
-                                equivalent to specifiying
+                                equivalent to specifying
                                 <option>--copy-locale</option>,
                                 <option>--copy-timezone</option>,
                                 <option>--copy-root-password</option>
@@ -249,7 +249,7 @@
                                 <term><option>--setup-machine-id</option></term>
 
                                 <para>Initialize the system's machine
-                                ID to a random ID. This only works
+                                ID to a random ID. This only works in
                                 combination with
                                 <option>--root=</option>.</para>
                         </varlistentry>

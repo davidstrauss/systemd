@@ -205,9 +205,9 @@ static uint8_t msg_reply[173] = {
 static int test_advertise_option(sd_event *e) {
         _cleanup_dhcp6_lease_free_ sd_dhcp6_lease *lease = NULL;
         DHCP6Message *advertise = (DHCP6Message *)msg_advertise;
-        uint8_t *optval, *opt = &msg_advertise[sizeof(DHCP6Message)];
+        uint8_t *optval, *opt = msg_advertise + sizeof(DHCP6Message);
         uint16_t optcode;
-        size_t optlen, len = sizeof(msg_advertise);
+        size_t optlen, len = sizeof(msg_advertise) - sizeof(DHCP6Message);
         be32_t val;
         uint8_t preference = 255;
         struct in6_addr addr;
@@ -267,6 +267,11 @@ static int test_advertise_option(sd_event *e) {
 
                         assert_se(dhcp6_lease_set_preference(lease,
                                                              *optval) >= 0);
+                        break;
+
+                case DHCP6_OPTION_ELAPSED_TIME:
+                        assert_se(optlen == 2);
+
                         break;
 
                 default:
@@ -361,7 +366,8 @@ static int test_client_verify_request(DHCP6Message *request, uint8_t *option,
         uint8_t *optval;
         uint16_t optcode;
         size_t optlen;
-        bool found_clientid = false, found_iana = false, found_serverid = false;
+        bool found_clientid = false, found_iana = false, found_serverid = false,
+                found_elapsed_time = false;
         int r;
         struct in6_addr addr;
         be32_t val;
@@ -410,11 +416,20 @@ static int test_client_verify_request(DHCP6Message *request, uint8_t *option,
                         assert_se(!memcmp(&msg_advertise[179], optval, optlen));
 
                         break;
+
+                case DHCP6_OPTION_ELAPSED_TIME:
+                        assert_se(!found_elapsed_time);
+                        found_elapsed_time = true;
+
+                        assert_se(optlen == 2);
+
+                        break;
                 }
         }
 
         assert_se(r == -ENOMSG);
-        assert_se(found_clientid && found_iana && found_serverid);
+        assert_se(found_clientid && found_iana && found_serverid &&
+                  found_elapsed_time);
 
         assert_se(sd_dhcp6_lease_get_first_address(lease, &addr, &lt_pref,
                                                    &lt_valid) >= 0);
@@ -452,7 +467,8 @@ static int test_client_verify_solicit(DHCP6Message *solicit, uint8_t *option,
         uint8_t *optval;
         uint16_t optcode;
         size_t optlen;
-        bool found_clientid = false, found_iana = false;
+        bool found_clientid = false, found_iana = false,
+                found_elapsed_time = false;
         int r;
 
         assert_se(solicit->type == DHCP6_SOLICIT);
@@ -478,11 +494,19 @@ static int test_client_verify_solicit(DHCP6Message *solicit, uint8_t *option,
                         memcpy(&test_iaid, optval, sizeof(test_iaid));
 
                         break;
+
+                case DHCP6_OPTION_ELAPSED_TIME:
+                        assert_se(!found_elapsed_time);
+                        found_elapsed_time = true;
+
+                        assert_se(optlen == 2);
+
+                        break;
                 }
         }
 
         assert_se(r == -ENOMSG);
-        assert_se(found_clientid && found_iana);
+        assert_se(found_clientid && found_iana && found_elapsed_time);
 
         return 0;
 }
@@ -537,7 +561,7 @@ static void test_client_solicit_cb(sd_dhcp6_client *client, int event,
 
 static int test_client_solicit(sd_event *e) {
         sd_dhcp6_client *client;
-        usec_t time_now = now(CLOCK_MONOTONIC);
+        usec_t time_now = now(clock_boottime_or_monotonic());
 
         if (verbose)
                 printf("* %s\n", __FUNCTION__);
@@ -553,7 +577,7 @@ static int test_client_solicit(sd_event *e) {
         assert_se(sd_dhcp6_client_set_callback(client,
                                                test_client_solicit_cb, e) >= 0);
 
-        assert_se(sd_event_add_time(e, &hangcheck, CLOCK_MONOTONIC,
+        assert_se(sd_event_add_time(e, &hangcheck, clock_boottime_or_monotonic(),
                                     time_now + 2 * USEC_PER_SEC, 0,
                                     test_hangcheck, NULL) >= 0);
 

@@ -52,11 +52,11 @@ typedef struct Context {
         Hashmap *polkit_registry;
 } Context;
 
-static void context_free(Context *c, sd_bus *bus) {
+static void context_free(Context *c) {
         assert(c);
 
         free(c->zone);
-        bus_verify_polkit_async_registry_free(bus, c->polkit_registry);
+        bus_verify_polkit_async_registry_free(c->polkit_registry);
 }
 
 static int context_read_data(Context *c) {
@@ -395,7 +395,7 @@ static int method_set_timezone(sd_bus *bus, sd_bus_message *m, void *userdata, s
         if (streq_ptr(z, c->zone))
                 return sd_bus_reply_method_return(m, NULL);
 
-        r = bus_verify_polkit_async(bus, &c->polkit_registry, m, "org.freedesktop.timedate1.set-timezone", interactive, error, method_set_timezone, c);
+        r = bus_verify_polkit_async(m, CAP_SYS_TIME, "org.freedesktop.timedate1.set-timezone", interactive, &c->polkit_registry, error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -456,7 +456,7 @@ static int method_set_local_rtc(sd_bus *bus, sd_bus_message *m, void *userdata, 
         if (lrtc == c->local_rtc)
                 return sd_bus_reply_method_return(m, NULL);
 
-        r = bus_verify_polkit_async(bus, &c->polkit_registry, m, "org.freedesktop.timedate1.set-local-rtc", interactive, error, method_set_local_rtc, c);
+        r = bus_verify_polkit_async(m, CAP_SYS_TIME, "org.freedesktop.timedate1.set-local-rtc", interactive, &c->polkit_registry, error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -561,7 +561,7 @@ static int method_set_time(sd_bus *bus, sd_bus_message *m, void *userdata, sd_bu
         } else
                 timespec_store(&ts, (usec_t) utc);
 
-        r = bus_verify_polkit_async(bus, &c->polkit_registry, m, "org.freedesktop.timedate1.set-time", interactive, error, method_set_time, c);
+        r = bus_verify_polkit_async(m, CAP_SYS_TIME, "org.freedesktop.timedate1.set-time", interactive, &c->polkit_registry, error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -601,7 +601,7 @@ static int method_set_ntp(sd_bus *bus, sd_bus_message *m, void *userdata, sd_bus
         if ((bool)ntp == c->use_ntp)
                 return sd_bus_reply_method_return(m, NULL);
 
-        r = bus_verify_polkit_async(bus, &c->polkit_registry, m, "org.freedesktop.timedate1.set-ntp", interactive, error, method_set_ntp, c);
+        r = bus_verify_polkit_async(m, CAP_SYS_TIME, "org.freedesktop.timedate1.set-ntp", interactive, &c->polkit_registry, error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -641,7 +641,7 @@ static const sd_bus_vtable timedate_vtable[] = {
 };
 
 static int connect_bus(Context *c, sd_event *event, sd_bus **_bus) {
-        _cleanup_bus_unref_ sd_bus *bus = NULL;
+        _cleanup_bus_close_unref_ sd_bus *bus = NULL;
         int r;
 
         assert(c);
@@ -681,7 +681,7 @@ static int connect_bus(Context *c, sd_event *event, sd_bus **_bus) {
 int main(int argc, char *argv[]) {
         Context context = {};
         _cleanup_event_unref_ sd_event *event = NULL;
-        _cleanup_bus_unref_ sd_bus *bus = NULL;
+        _cleanup_bus_close_unref_ sd_bus *bus = NULL;
         int r;
 
         log_set_target(LOG_TARGET_AUTO);
@@ -727,7 +727,7 @@ int main(int argc, char *argv[]) {
         }
 
 finish:
-        context_free(&context, bus);
+        context_free(&context);
 
         return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }

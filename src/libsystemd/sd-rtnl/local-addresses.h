@@ -26,12 +26,13 @@
 #include <assert.h>
 #include <sys/socket.h>
 
+#include "sd-rtnl.h"
 #include "in-addr-util.h"
 
 struct local_address {
-        int ifindex;
-        unsigned char family, scope;
+        int family, ifindex;
+        unsigned char scope;
         union in_addr_union address;
 };
 
-int local_addresses(struct local_address **ret);
+int local_addresses(sd_rtnl *rtnl, int ifindex, struct local_address **ret);

@@ -20,7 +20,7 @@
 AC_PREREQ([2.64])
 
 AC_INIT([systemd],
-        [215],
+        [216],
         [http://bugs.freedesktop.org/enter_bug.cgi?product=systemd],
         [systemd],
         [http://www.freedesktop.org/wiki/Software/systemd])
@@ -62,7 +62,7 @@ AS_IF([test x"$intltool_found" != xyes],
       ])
 
 AM_NLS
-AS_IF([test x"$enable_nls" != xno], [
+AS_IF([test x"$enable_nls" != xno -o "x$enable_polkit" != xno], [
     # intltoolize greps for '^(AC|IT)_PROG_INTLTOOL', so it needs to be on its own line
 IT_PROG_INTLTOOL([0.40.0])
 ])
@@ -183,6 +183,7 @@ CC_CHECK_FLAGS_APPEND([with_cflags], [CFLAGS], [\
         -Wno-unused-parameter \
         -Wno-missing-field-initializers \
         -Wno-unused-result \
+        -Wno-typedef-redefinition \
         -Werror=overflow \
         -Wdate-time \
         -Wnested-externs \
@@ -224,6 +225,7 @@ AC_CHECK_SIZEOF(pid_t)
 AC_CHECK_SIZEOF(uid_t)
 AC_CHECK_SIZEOF(gid_t)
 AC_CHECK_SIZEOF(time_t)
+AC_CHECK_SIZEOF(dev_t)
 AC_CHECK_SIZEOF(rlim_t,,[
        #include <sys/time.h>
        #include <sys/resource.h>
@@ -310,7 +312,9 @@ AC_CHECK_DECLS([gettid, pivot_root, name_to_handle_at, setns, LO_FLAGS_PARTSCAN]
 #include <linux/loop.h>
 ]])
 
-AC_CHECK_DECLS([IFLA_PHYS_PORT_ID,
+AC_CHECK_DECLS([IFLA_MACVLAN_FLAGS,
+                IFLA_VTI_REMOTE,
+                IFLA_PHYS_PORT_ID,
                 IFLA_BOND_AD_INFO,
                 IFLA_VLAN_PROTOCOL,
                 IFLA_VXLAN_LOCAL6,
@@ -497,6 +501,14 @@ AC_ARG_WITH([debug-tty],
         [DEBUGTTY=/dev/tty9])
 
 AC_SUBST(DEBUGTTY)
+
+AC_ARG_WITH([certificate-root],
+        AS_HELP_STRING([--with-certificate-root=PATH],
+                [Specify the prefix for TLS certificates [/etc/ssl]]),
+        [CERTIFICATEROOT="$withval"],
+        [CERTIFICATEROOT="/etc/ssl"])
+
+AC_SUBST(CERTIFICATEROOT)
 
 # ------------------------------------------------------------------------------
 have_xz=no
@@ -788,6 +800,33 @@ fi
 AM_CONDITIONAL(HAVE_GNUTLS, [test "$have_gnutls" = "yes"])
 
 # ------------------------------------------------------------------------------
+have_libcurl=no
+AC_ARG_ENABLE(libcurl, AS_HELP_STRING([--disable-libcurl], [disable libcurl support]))
+if test "x$enable_libcurl" != "xno"; then
+        PKG_CHECK_MODULES(LIBCURL, [libcurl],
+                [AC_DEFINE(HAVE_LIBCURL, 1, [Define if libcurl is available]) have_libcurl=yes], have_libcurl=no)
+        if test "x$have_libcurl" = xno -a "x$enable_libcurl" = xyes; then
+                AC_MSG_ERROR([*** libcurl support requested but libraries not found])
+        fi
+fi
+AM_CONDITIONAL(HAVE_LIBCURL, [test "$have_libcurl" = "yes"])
+
+# ------------------------------------------------------------------------------
+have_libidn=no
+AC_ARG_ENABLE(libidn, AS_HELP_STRING([--disable-libidn], [Disable optional LIBIDN support]))
+if test "x$enable_libidn" != "xno"; then
+        PKG_CHECK_MODULES(LIBIDN, [libidn],
+               [AC_DEFINE(HAVE_LIBIDN, 1, [Define if libidn is available])
+                have_libidn=yes
+                M4_DEFINES="$M4_DEFINES -DHAVE_LIBIDN"],
+               [have_libidn=no])
+        if test "x$have_libidn" = "xno" -a "x$enable_libidn" = "xyes"; then
+                AC_MSG_ERROR([*** libidn support requested but libraries not found])
+        fi
+fi
+AM_CONDITIONAL(HAVE_LIBIDN, [test "$have_libidn" = "yes"])
+
+# ------------------------------------------------------------------------------
 have_binfmt=no
 AC_ARG_ENABLE(binfmt, AS_HELP_STRING([--disable-binfmt], [disable binfmt tool]))
 if test "x$enable_binfmt" != "xno"; then
@@ -984,6 +1023,7 @@ have_resolved=no
 AC_ARG_ENABLE(resolved, AS_HELP_STRING([--disable-resolved], [disable resolve daemon]))
 if test "x$enable_resolved" != "xno"; then
         have_resolved=yes
+        M4_DEFINES="$M4_DEFINES -DENABLE_RESOLVED"
 fi
 AM_CONDITIONAL(ENABLE_RESOLVED, [test "$have_resolved" = "yes"])
 
@@ -1021,6 +1061,18 @@ if test "x$enable_multi_seat_x" != "xno"; then
         have_multi_seat_x=yes
 fi
 AM_CONDITIONAL(ENABLE_MULTI_SEAT_X, [test "$have_multi_seat_x" = "yes"])
+
+# ------------------------------------------------------------------------------
+have_terminal=no
+AC_ARG_ENABLE(terminal, AS_HELP_STRING([--enable-terminal], [enable terminal support]))
+if test "x$enable_terminal" = "xyes"; then
+        PKG_CHECK_MODULES([TERMINAL], [ libevdev >= 1.2 xkbcommon >= 0.4 ], [have_terminal=yes])
+        AS_IF([test "x$have_terminal" != xyes -a "x$enable_terminal" = xyes],
+              [AC_MSG_ERROR([*** terminal support requested but required dependencies not available])],
+              [test "x$have_terminal" = xyes],
+              [AC_DEFINE(ENABLE_TERMINAL, 1, [Define if terminal support is to be enabled])])
+fi
+AM_CONDITIONAL(ENABLE_TERMINAL, [test "x$have_terminal" = "xyes"])
 
 # ------------------------------------------------------------------------------
 have_kdbus=no
@@ -1102,25 +1154,6 @@ fi
 AM_CONDITIONAL(HAVE_MYHOSTNAME, [test "$have_myhostname" = "yes"])
 
 # ------------------------------------------------------------------------------
-AC_ARG_WITH(firmware-path,
-       AS_HELP_STRING([--with-firmware-path=DIR[[[:DIR[...]]]]],
-          [Firmware search path (default="")]),
-       [], [with_firmware_path=""])
-OLD_IFS=$IFS
-IFS=:
-for i in $with_firmware_path; do
-       if test "x${FIRMWARE_PATH}" = "x"; then
-              FIRMWARE_PATH="\\\"${i}/\\\""
-       else
-              FIRMWARE_PATH="${FIRMWARE_PATH}, \\\"${i}/\\\""
-       fi
-done
-IFS=$OLD_IFS
-AC_SUBST(FIRMWARE_PATH)
-AS_IF([test "x${FIRMWARE_PATH}" != "x"], [ AC_DEFINE(HAVE_FIRMWARE, 1, [Define if FIRMWARE is available]) ])
-AM_CONDITIONAL(ENABLE_FIRMWARE, [test "x${FIRMWARE_PATH}" != "x"])
-
-# ------------------------------------------------------------------------------
 AC_ARG_ENABLE([gudev],
        AS_HELP_STRING([--disable-gudev], [disable Gobject libudev support @<:@default=enabled@:>@]),
        [], [enable_gudev=yes])
@@ -1135,7 +1168,18 @@ AS_IF([test "x$enable_manpages" != xno], [have_manpages=yes])
 AM_CONDITIONAL(ENABLE_MANPAGES, [test "x$have_manpages" = "xyes"])
 
 # ------------------------------------------------------------------------------
+AC_ARG_ENABLE(hibernate,
+       [AC_HELP_STRING([--disable-hibernate], [disable hibernation support])],
+       enable_hibernate=$enableval, enable_hibernate=yes)
+AM_CONDITIONAL(ENABLE_HIBERNATE, [test x$enable_hibernate = xyes])
 
+# ------------------------------------------------------------------------------
+AC_ARG_ENABLE(ldconfig,
+       [AC_HELP_STRING([--disable-ldconfig], [disable ldconfig])],
+       enable_ldconfig=$enableval, enable_ldconfig=yes)
+AM_CONDITIONAL(ENABLE_LDCONFIG, [test x$enable_ldconfig = xyes])
+
+# ------------------------------------------------------------------------------
 # Location of the init scripts as mandated by LSB
 SYSTEM_SYSVINIT_PATH=/etc/init.d
 SYSTEM_SYSVRCND_PATH=/etc/rc.d
@@ -1293,6 +1337,8 @@ AC_MSG_RESULT([
         MICROHTTPD:              ${have_microhttpd}
         CHKCONFIG:               ${have_chkconfig}
         GNUTLS:                  ${have_gnutls}
+        libcurl:                 ${have_libcurl}
+        libidn:                  ${have_libidn}
         ELFUTILS:                ${have_elfutils}
         binfmt:                  ${have_binfmt}
         vconsole:                ${have_vconsole}
@@ -1326,6 +1372,7 @@ AC_MSG_RESULT([
         gudev:                   ${enable_gudev}
         gintrospection:          ${enable_introspection}
         multi-seat-x:            ${have_multi_seat_x}
+        terminal:                ${have_terminal}
         kdbus:                   ${have_kdbus}
         Python:                  ${have_python}
         Python Headers:          ${have_python_devel}
@@ -1349,7 +1396,6 @@ AC_MSG_RESULT([
         Build Python:            ${PYTHON}
         Installation Python:     ${PYTHON_BINARY}
         sphinx binary:           ${SPHINX_BUILD}
-        firmware path:           ${FIRMWARE_PATH}
         PAM modules dir:         ${with_pamlibdir}
         PAM configuration dir:   ${with_pamconfdir}
         D-Bus policy dir:        ${with_dbuspolicydir}
@@ -1364,6 +1410,7 @@ AC_MSG_RESULT([
         TTY GID:                 ${TTY_GID}
         Maximum System UID:      ${SYSTEM_UID_MAX}
         Maximum System GID:      ${SYSTEM_GID_MAX}
+        Certificate root:        ${CERTIFICATEROOT}
 
         CFLAGS:                  ${OUR_CFLAGS} ${CFLAGS}
         CPPFLAGS:                ${OUR_CPPFLAGS} ${CPPFLAGS}

@@ -205,6 +205,9 @@ Service.NonBlocking,             config_parse_bool,                  0,         
 Service.BusName,                 config_parse_unit_string_printf,    0,                             offsetof(Service, bus_name)
 Service.NotifyAccess,            config_parse_notify_access,         0,                             offsetof(Service, notify_access)
 Service.Sockets,                 config_parse_service_sockets,       0,                             0
+m4_ifdef(`ENABLE_KDBUS',
+`Service.BusPolicy,              config_parse_bus_endpoint_policy,   0,                             offsetof(Service, exec_context)',
+`Service.BusPolicy,              config_parse_warn_compat,           0,                             0')
 EXEC_CONTEXT_CONFIG_ITEMS(Service)m4_dnl
 CGROUP_CONTEXT_CONFIG_ITEMS(Service)m4_dnl
 KILL_CONTEXT_CONFIG_ITEMS(Service)m4_dnl
@@ -231,6 +234,11 @@ Socket.DirectoryMode,            config_parse_mode,                  0,         
 Socket.Accept,                   config_parse_bool,                  0,                             offsetof(Socket, accept)
 Socket.MaxConnections,           config_parse_unsigned,              0,                             offsetof(Socket, max_connections)
 Socket.KeepAlive,                config_parse_bool,                  0,                             offsetof(Socket, keep_alive)
+Socket.KeepAliveTimeSec,         config_parse_sec,                   0,                             offsetof(Socket, keep_alive_time)
+Socket.KeepAliveIntervalSec,     config_parse_sec,                   0,                             offsetof(Socket, keep_alive_interval)
+Socket.KeepAliveProbes,          config_parse_unsigned,              0,                             offsetof(Socket, keep_alive_cnt)
+Socket.DeferAcceptSec,           config_parse_sec,                   0,                             offsetof(Socket, defer_accept)
+Socket.NoDelay,                  config_parse_bool,                  0,                             offsetof(Socket, no_delay)
 Socket.Priority,                 config_parse_int,                   0,                             offsetof(Socket, priority)
 Socket.ReceiveBuffer,            config_parse_iec_size,              0,                             offsetof(Socket, receive_buffer)
 Socket.SendBuffer,               config_parse_iec_size,              0,                             offsetof(Socket, send_buffer)
