@@ -423,7 +423,6 @@ static int automount_send_ready(Automount *a, Set *tokens, int status) {
 
         if (set_isempty(tokens))
                 return 0;
-        log_error_unit(UNIT(a)->id, "automount_send_ready %s", strerror(-status));
 
         ioctl_fd = open_ioctl_fd(UNIT(a)->manager->dev_autofs_fd, a->where, a->dev_id);
         if (ioctl_fd < 0)
@@ -461,8 +460,6 @@ int automount_update_mount(Automount *a, MountState old_state, MountState state)
         _cleanup_close_ int ioctl_fd = -1;
 
         assert(a);
-
-        log_error_unit(UNIT(a)->id, "automount_update_mount %d", state);
 
         if (state == MOUNT_MOUNTED || state == MOUNT_REMOUNTING)
                 automount_send_ready(a, a->tokens, 0);
@@ -599,12 +596,12 @@ struct expire_data {
 
 static inline void cleanup_expire(void *p) {
         struct expire_data *data = *(struct expire_data**)p;
+
         if (!data)
                 return;
-        if (data->dev_autofs_fd > 0)
-                close(data->dev_autofs_fd);
-        if (data->ioctl_fd > 0)
-                close(data->ioctl_fd);
+
+        safe_close(data->dev_autofs_fd);
+        safe_close(data->ioctl_fd);
         free(data);
 }
 #define _cleanup_expire_ _cleanup_(cleanup_expire)
@@ -641,6 +638,8 @@ static int automount_dispatch_expire(sd_event_source *source, usec_t usec, void 
         data = malloc0(sizeof(struct expire_data));
         if (!data)
                 return -ENOMEM;
+
+        data->ioctl_fd = -1;
 
         data->dev_autofs_fd = dup(UNIT(a)->manager->dev_autofs_fd);
         if (data->dev_autofs_fd < 0)
