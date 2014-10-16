@@ -374,7 +374,7 @@ static int autofs_protocol(int dev_autofs_fd, int ioctl_fd) {
         return 0;
 }
 
-static int autofs_set_timeout(int dev_autofs_fd, int ioctl_fd, time_t sec) {
+static int autofs_set_timeout(int dev_autofs_fd, int ioctl_fd, usec_t usec) {
         struct autofs_dev_ioctl param;
 
         assert(dev_autofs_fd >= 0);
@@ -382,7 +382,9 @@ static int autofs_set_timeout(int dev_autofs_fd, int ioctl_fd, time_t sec) {
 
         init_autofs_dev_ioctl(&param);
         param.ioctlfd = ioctl_fd;
-        param.timeout.timeout = sec;
+
+        /* Convert to seconds, rounding up. */
+        param.timeout.timeout = usec / USEC_PER_SEC + (usec % USEC_PER_SEC > 0);
 
         if (ioctl(dev_autofs_fd, AUTOFS_DEV_IOCTL_TIMEOUT, &param) < 0)
                 return -errno;
@@ -556,7 +558,7 @@ static void automount_enter_waiting(Automount *a) {
         if (r < 0)
                 goto fail;
 
-        r = autofs_set_timeout(dev_autofs_fd, ioctl_fd, 20);
+        r = autofs_set_timeout(dev_autofs_fd, ioctl_fd, a->timeout_idle_usec);
         if (r < 0)
                 goto fail;
 

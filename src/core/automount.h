@@ -47,6 +47,7 @@ struct Automount {
         AutomountState state, deserialized_state;
 
         char *where;
+        usec_t timeout_idle_usec;
 
         int pipe_fd;
         sd_event_source *pipe_event_source;
